@@ -1,1137 +1,729 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>mRNA Stability Analyser</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
-<style>
-:root{
-  --lav50:#f5f3ff;--lav100:#ede9fe;--lav200:#ddd6fe;--lav300:#c4b5fd;--lav400:#a78bfa;--lav500:#8b5cf6;--lav600:#7c3aed;--lav700:#6d28d9;
-  --neu50:#fafaf9;--neu100:#f5f5f4;--neu200:#e7e5e4;--neu600:#57534e;--neu700:#44403c;
-  --rose100:#ffe4e6;--teal100:#ccfbf1;--teal300:#5eead4;--teal600:#0d9488;
-  --amber100:#fef3c7;--amber300:#fcd34d;
-  --green100:#dcfce7;--green500:#22c55e;--green600:#16a34a;
-  --red100:#fee2e2;--red500:#ef4444;
-  --ind50:#eef2ff;--ind100:#e0e7ff;--ind200:#c7d2fe;--ind400:#818cf8;--ind500:#6366f1;--ind600:#4f46e5;--ind700:#4338ca;
-  --bg:#fdfcff;--surface:#fff;--border:#e8e4f0;--tp:#1e1b2e;--ts:#6b6780;--tm:#9d9ab0;
-  --r:10px;--rl:16px;--rs:6px;
+import { useState, useMemo } from "react";
+import * as XLSX from "xlsx";
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ErrorBar, ResponsiveContainer, Scatter, ScatterChart, ZAxis } from "recharts";
+
+const PALETTE = ["#7C6FAF","#A78BCC","#5B8DB8","#6BBFA3","#C9A96E","#C97B7B","#7BAF8E","#B07BAF"];
+const DEFAULT_TIMEPOINTS = [0,5,10,20,40,60,80,100,120];
+const ROWS = ["A","B","C","D","E","F","G","H"];
+
+const toNum = v => { if(v===null||v===undefined||v==="") return NaN; if(typeof v==="number") return v; return parseFloat(String(v).replace(",",".")); };
+const mean = arr => arr.reduce((a,b)=>a+b,0)/arr.length;
+const stdDev = arr => { if(arr.length<2) return 0; const m=mean(arr); return Math.sqrt(arr.reduce((a,b)=>a+(b-m)**2,0)/(arr.length-1)); };
+
+// ── Levenberg-Marquardt: A(t) = Amax*(1−exp(−k*t)) ─────────────────────────
+function fitExpAssoc(tps, vals) {
+  const valid = tps.map((t,i)=>({t,y:vals[i]})).filter(p=>isFinite(p.y)&&isFinite(p.t));
+  if (valid.length < 4) return { error: `Only ${valid.length} valid point(s) — minimum 4 required` };
+  const model = (t,A,k) => A*(1-Math.exp(-k*t));
+  const calcSSE = (A,k) => valid.reduce((s,p)=>s+(p.y-model(p.t,A,k))**2, 0);
+  const maxY = Math.max(...valid.map(p=>p.y));
+  const inits = [
+    [maxY>0?maxY:0.5, 0.05], [maxY>0?maxY*1.5:1, 0.02],
+    [maxY>0?maxY*0.8:0.3, 0.1], [0.5, 0.03], [1.0, 0.01]
+  ];
+  let best = null;
+  for (const [A0,k0] of inits) {
+    let A=A0, k=Math.max(k0,1e-5), lambda=0.01, prevSSE=calcSSE(A,k);
+    for (let iter=0;iter<3000;iter++) {
+      const J=valid.map(p=>[1-Math.exp(-k*p.t), A*p.t*Math.exp(-k*p.t)]);
+      const r=valid.map(p=>p.y-model(p.t,A,k));
+      let JtJ=[[0,0],[0,0]], Jtr=[0,0];
+      valid.forEach((_,i)=>{ JtJ[0][0]+=J[i][0]**2; JtJ[0][1]+=J[i][0]*J[i][1]; JtJ[1][0]+=J[i][1]*J[i][0]; JtJ[1][1]+=J[i][1]**2; Jtr[0]+=J[i][0]*r[i]; Jtr[1]+=J[i][1]*r[i]; });
+      JtJ[0][0]+=lambda; JtJ[1][1]+=lambda;
+      const det=JtJ[0][0]*JtJ[1][1]-JtJ[0][1]*JtJ[1][0];
+      if(Math.abs(det)<1e-15) break;
+      const dA=(JtJ[1][1]*Jtr[0]-JtJ[0][1]*Jtr[1])/det;
+      const dk=(JtJ[0][0]*Jtr[1]-JtJ[1][0]*Jtr[0])/det;
+      const nA=A+dA, nK=Math.max(1e-6,k+dk), nSSE=calcSSE(nA,nK);
+      if(nSSE<prevSSE){A=nA;k=nK;prevSSE=nSSE;lambda=Math.max(lambda/10,1e-10);}
+      else lambda=Math.min(lambda*10,1e8);
+      if(Math.abs(dA)<1e-9&&Math.abs(dk)<1e-11) break;
+    }
+    if(!best||calcSSE(A,k)<calcSSE(best.A,best.k)) best={A,k};
+  }
+  const {A:Amax,k}=best;
+  const ym=valid.reduce((s,p)=>s+p.y,0)/valid.length;
+  const ssTot=valid.reduce((s,p)=>s+(p.y-ym)**2,0);
+  const ssRes=calcSSE(Amax,k);
+  const r2=ssTot>1e-12?Math.max(0,1-ssRes/ssTot):NaN;
+  return { Amax, k, tHalf:Math.log(2)/k, r2, rmse:Math.sqrt(ssRes/valid.length), n:valid.length };
 }
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tp);font-size:14px;line-height:1.6}
-#app{display:flex;min-height:100vh}
-#sidebar{width:220px;background:var(--surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0;display:flex;flex-direction:column}
-#main{flex:1;padding:32px;overflow-y:auto;max-width:1100px}
-.logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
-.logo-title{font-size:13px;font-weight:700;color:var(--lav600);letter-spacing:.04em;text-transform:uppercase}
-.logo-sub{font-size:11px;color:var(--tm);margin-top:2px}
-.ns{padding:8px 20px 4px;font-size:10px;font-weight:700;color:var(--tm);text-transform:uppercase;letter-spacing:.08em}
-.ni{display:flex;align-items:center;gap:10px;padding:9px 20px;cursor:pointer;border-left:3px solid transparent;color:var(--ts);font-size:13px;transition:all .15s;user-select:none}
-.ni:hover{background:var(--lav50);color:var(--lav700)}
-.ni.active{background:var(--lav50);border-left-color:var(--lav500);color:var(--lav700);font-weight:600}
-.ni.mech:hover{background:var(--ind50);color:var(--ind700)}
-.ni.mech.active{background:var(--ind50);border-left-color:var(--ind500);color:var(--ind700)}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:24px;margin-bottom:20px;box-shadow:0 1px 4px rgba(100,80,200,.07)}
-.card.mc{border-color:var(--ind200)}
-.card.mc th{background:var(--ind50);color:var(--ind700);border-bottom-color:var(--ind200)}
-.ch{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
-.ct{font-size:15px;font-weight:700}.cs{font-size:12px;color:var(--tm);margin-top:2px}
-.sb{display:flex;margin-bottom:32px;background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:4px}
-.si{flex:1;display:flex;align-items:center;gap:8px;padding:10px 14px;border-radius:var(--r);color:var(--ts);font-size:12px;font-weight:500;transition:all .2s}
-.si.active{background:var(--lav100);color:var(--lav700);font-weight:700}
-.si.done{color:var(--teal600)}.si.locked{opacity:.4}
-.sn{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;background:var(--neu200);color:var(--neu600);flex-shrink:0}
-.si.active .sn{background:var(--lav400);color:#fff}.si.done .sn{background:var(--teal300);color:var(--teal600)}
-label{display:block;font-size:12px;font-weight:600;color:var(--ts);margin-bottom:5px}
-input[type=text],input[type=number],select,textarea{width:100%;padding:9px 12px;border:1px solid var(--border);border-radius:var(--rs);font-size:13px;color:var(--tp);background:var(--surface);outline:none;transition:border .15s}
-input:focus,select:focus,textarea:focus{border-color:var(--lav400);box-shadow:0 0 0 3px var(--lav100)}
-.fr{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:14px}
-.fg{margin-bottom:14px}
-.cr{display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--border);border-radius:var(--rs);cursor:pointer}
-.cr:hover{background:var(--lav50)}.cr input{width:auto}.cr span{font-size:13px;font-weight:500}
-.mc-box{border:1px solid var(--border);border-radius:var(--r);padding:14px 18px;margin-bottom:10px;background:var(--neu50)}
-.mc-box.on{border-color:var(--lav300);background:var(--lav50)}
-.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:var(--rs);font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s}
-.bp{background:var(--lav500);color:#fff}.bp:hover{background:var(--lav600)}
-.bs{background:var(--lav100);color:var(--lav700);border:1px solid var(--lav200)}.bs:hover{background:var(--lav200)}
-.bg{background:transparent;color:var(--ts);border:1px solid var(--border)}.bg:hover{background:var(--neu100)}
-.bi{background:var(--ind500);color:#fff}.bi:hover{background:var(--ind600)}
-.bsuc{background:var(--green500);color:#fff}.bsuc:hover{background:var(--green600)}
-.bsm{padding:6px 12px;font-size:12px}
-.br{display:flex;gap:10px;margin-top:20px;align-items:center}
-.badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600}
-.bl{background:var(--lav100);color:var(--lav700)}.bt{background:var(--teal100);color:var(--teal600)}
-.ba{background:var(--amber100);color:#92400e}.bro{background:var(--rose100);color:#9f1239}
-.bind{background:var(--ind100);color:var(--ind700)}
-.ft{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--lav600);cursor:pointer;border:1px solid var(--lav200);padding:3px 10px;border-radius:20px;background:var(--lav50);user-select:none;margin-top:8px}
-.ft:hover{background:var(--lav100)}
-.fb{background:var(--lav50);border:1px solid var(--lav200);border-radius:var(--r);padding:16px 20px;margin-top:10px;display:none}
-.fb.open{display:block}
-.fe{font-family:monospace;font-size:13px;color:var(--lav700);background:var(--lav100);padding:8px 14px;border-radius:var(--rs);margin:8px 0;border-left:3px solid var(--lav400)}
-.fe.ind{color:var(--ind700);background:var(--ind100);border-left-color:var(--ind400)}
-.fv{font-size:12px;color:var(--ts);line-height:1.9}
-.ib{background:var(--lav50);border:1px solid var(--lav200);border-radius:var(--rs);padding:12px 16px;font-size:12px;color:var(--ts);line-height:1.7;margin-top:12px}
-.ib.warn{background:var(--amber100);border-color:var(--amber300);color:#78350f}
-.ib.ok{background:var(--green100);border-color:var(--green500);color:#14532d}
-.ib.err{background:var(--red100);border-color:var(--red500);color:#7f1d1d}
-.ib.ind{background:var(--ind50);border-color:var(--ind200);color:var(--ind700)}
-.ctag{display:inline-flex;align-items:center;gap:6px;background:var(--lav100);border:1px solid var(--lav200);border-radius:20px;padding:4px 12px;font-size:12px;font-weight:600;color:var(--lav700);margin:3px}
-.ctag .rm{cursor:pointer;color:var(--lav400);font-size:14px}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{background:var(--lav50);padding:8px 12px;text-align:left;font-weight:700;color:var(--lav700);border-bottom:2px solid var(--lav200)}
-td{padding:8px 12px;border-bottom:1px solid var(--neu200)}
-tr:hover td{background:var(--neu50)}
-.pw{background:var(--neu50);border:1px solid var(--border);border-radius:var(--r);padding:16px;min-height:260px}
-.sg{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:16px}
-.sc{background:var(--lav50);border:1px solid var(--lav200);border-radius:var(--r);padding:14px 16px}
-.sc.ind{background:var(--ind50);border-color:var(--ind200)}
-.sl{font-size:11px;font-weight:700;color:var(--tm);text-transform:uppercase;letter-spacing:.04em}
-.sv{font-size:22px;font-weight:700;color:var(--lav700);margin-top:4px}
-.sv.ind{color:var(--ind600)}.su{font-size:12px;color:var(--ts);margin-top:1px}
-.pb{height:4px;background:var(--lav200);border-radius:4px;overflow:hidden;margin-top:8px}
-.pf{height:100%;background:linear-gradient(90deg,var(--lav400),var(--lav500));border-radius:4px;transition:width .4s}
-.vl{list-style:none;padding:0}
-.vi{display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px solid var(--neu200);font-size:12px}
-.vi:last-child{border:none}.vd{width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-top:4px}
-.vok .vd{background:var(--green500)}.verr .vd{background:var(--red500)}.vwarn .vd{background:var(--amber300)}
-.uz{border:2px dashed var(--lav300);border-radius:var(--rl);padding:40px;text-align:center;cursor:pointer;transition:all .2s;background:var(--lav50)}
-.uz:hover,.uz.drag{border-color:var(--lav500);background:var(--lav100)}
-.sep{border:none;border-top:1px solid var(--border);margin:20px 0}
-.tir{display:flex;gap:8px;margin-bottom:8px}
-.view{display:none}.view.active{display:block}
-.pt{font-size:22px;font-weight:800;margin-bottom:4px}
-.ps{font-size:13px;color:var(--ts);margin-bottom:24px}
-.ws{margin-bottom:30px}
-.ws h3{font-size:14px;font-weight:700;color:var(--lav700);margin-bottom:10px;padding-bottom:6px;border-bottom:2px solid var(--lav200)}
-.ws h3.ind{color:var(--ind700);border-bottom-color:var(--ind200)}
-.ws p{font-size:13px;line-height:1.8;margin-bottom:10px}
-.wf{font-family:monospace;background:var(--lav100);padding:10px 16px;border-radius:var(--rs);border-left:3px solid var(--lav400);font-size:13px;color:var(--lav700);margin:10px 0}
-.wf.ind{background:var(--ind100);border-left-color:var(--ind400);color:var(--ind700)}
-.ws ul{margin-left:20px;font-size:13px;line-height:2}
-.wtoc{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:28px}
-.wl{font-size:12px;padding:5px 12px;background:var(--lav100);border:1px solid var(--lav200);border-radius:20px;color:var(--lav700);cursor:pointer;font-weight:600}
-.wl:hover{background:var(--lav200)}
-.wl.ind{background:var(--ind100);border-color:var(--ind200);color:var(--ind700)}.wl.ind:hover{background:var(--ind200)}
-.ic{display:inline-flex;align-items:center;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:600;margin:2px}
-.is{background:#dcfce7;color:#14532d}.itr{background:var(--ind100);color:var(--ind700)}
-.im{background:var(--amber100);color:#78350f}.iu{background:var(--neu200);color:var(--neu700)}
-@media(max-width:768px){#sidebar{display:none}#main{padding:16px}}
-</style>
-</head>
-<body>
-<div id="app">
-<nav id="sidebar">
-  <div class="logo"><div class="logo-title">mRNA Stability Analyser</div><div class="logo-sub">ODE Model: Mauger et al. 2019 &amp; Spiewla et al. 2026</div></div>
-  <div class="ns">Workflow</div>
-  <div class="ni active" id="nav-setup"><span>&#9881;</span> Experiment Setup</div>
-  <div class="ni" id="nav-template"><span>&#128196;</span> Excel Template</div>
-  <div class="ni" id="nav-upload"><span>&#8679;</span> Data Upload</div>
-  <div class="ni" id="nav-analysis"><span>&#128202;</span> Analysis</div>
-  <div class="ni mech" id="nav-mechanistic"><span>&#129516;</span> Mechanistic Model</div>
-  <div class="ni" id="nav-results"><span>&#128300;</span> Results</div>
 
-  <div class="ns" style="margin-top:16px">Reference</div>
-  <div class="ni" id="nav-export"><span>&#128190;</span> Export Charts</div>
-  <div class="ni" id="nav-wiki"><span>&#128218;</span> Analysis Wiki</div>
-  <div style="flex:1"></div>
-  <div style="padding:16px 20px;font-size:10px;color:var(--tm);border-top:1px solid var(--border);line-height:1.7">BnT Internship Analysis Suite<br/><span style="color:var(--lav500);font-weight:700">Sophia Marshall</span></div>
-</nav>
-<main id="main">
+const S = {
+  app: { minHeight:"100vh", background:"#F3F0FA", fontFamily:"'Segoe UI',system-ui,sans-serif", color:"#2d2540", padding:"24px" },
+  card: { background:"#fff", borderRadius:"12px", border:"1px solid #DDD6F0", padding:"24px", marginBottom:"20px", boxShadow:"0 2px 8px rgba(120,100,180,0.07)" },
+  h1: { fontSize:"22px", fontWeight:700, color:"#5B4A8A", marginBottom:"4px" },
+  h2: { fontSize:"16px", fontWeight:600, color:"#7C6FAF", marginBottom:"16px" },
+  label: { fontSize:"13px", color:"#6b5f8a", fontWeight:500, display:"block", marginBottom:"4px" },
+  input: { width:"100%", padding:"8px 10px", borderRadius:"8px", border:"1px solid #C8BDE8", fontSize:"13px", outline:"none", boxSizing:"border-box", background:"#FDFBFF" },
+  btn: { padding:"9px 18px", borderRadius:"8px", border:"none", cursor:"pointer", fontSize:"13px", fontWeight:600 },
+  btnPrimary: { background:"#7C6FAF", color:"#fff" },
+  btnSecondary: { background:"#EDE9F8", color:"#5B4A8A" },
+  table: { width:"100%", borderCollapse:"collapse", fontSize:"13px" },
+  th: { background:"#EDE9F8", padding:"8px 10px", textAlign:"left", color:"#5B4A8A", fontWeight:600, borderBottom:"2px solid #C8BDE8" },
+  td: { padding:"7px 10px", borderBottom:"1px solid #F0ECF9" },
+  tag: { display:"inline-block", padding:"2px 8px", borderRadius:"12px", fontSize:"11px", background:"#EDE9F8", color:"#7C6FAF" },
+  row: { display:"flex", gap:"16px", flexWrap:"wrap" },
+  col: { flex:1, minWidth:"200px" },
+  tabBar: { display:"flex", gap:"8px", marginBottom:"16px", flexWrap:"wrap" },
+  tab: a=>({ padding:"7px 16px", borderRadius:"8px", border:"none", cursor:"pointer", fontSize:"13px", fontWeight:600, background:a?"#7C6FAF":"#EDE9F8", color:a?"#fff":"#5B4A8A" }),
+  badge: { display:"inline-block", background:"#7C6FAF", color:"#fff", borderRadius:"99px", padding:"1px 8px", fontSize:"11px", marginLeft:"6px" },
+  error: { background:"#FFF0F0", border:"1px solid #F5C0C0", borderRadius:"8px", padding:"10px 14px", color:"#b03030", fontSize:"13px" },
+};
 
-<!-- SETUP -->
-<div id="view-setup" class="view active">
-  <div class="pt">Experiment Setup</div>
-  <div class="ps">Define your experimental design before generating the data template.</div>
-  <div class="sb">
-    <div class="si active" id="wstep-1"><div class="sn">1</div> General</div>
-    <div class="si locked" id="wstep-2"><div class="sn">2</div> Constructs</div>
-    <div class="si locked" id="wstep-3"><div class="sn">3</div> Assays</div>
-    <div class="si locked" id="wstep-4"><div class="sn">4</div> Confirm</div>
-  </div>
-  <div id="setup-step-1">
-    <div class="card">
-      <div class="ch"><div><div class="ct">General Information</div></div></div>
-      <div class="fr">
-        <div class="fg"><label>Experiment Title *</label><input type="text" id="exp-title" placeholder="e.g. UTR Modification Screen"/></div>
-        <div class="fg"><label>Project Name</label><input type="text" id="exp-project" placeholder="e.g. mRNA Therapeutics 2025"/></div>
-      </div>
-      <div class="fr">
-        <div class="fg"><label>Principal Investigator</label><input type="text" id="exp-pi"/></div>
-        <div class="fg"><label>Date</label><input type="text" id="exp-date" placeholder="e.g. 2025-06-15"/></div>
-      </div>
-      <div class="fg"><label>Notes</label><textarea id="exp-notes" rows="2"></textarea></div>
-    </div>
-    <div class="br"><button class="btn bp" id="btn-s1">Continue</button></div>
-    <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
-      <div style="font-size:11px;font-weight:700;color:var(--tm);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">&#127358; Optional — Demo Dataset</div>
-      <div style="font-size:12px;color:var(--ts);margin-bottom:10px">Skip setup and load a prebuilt example with 2 constructs (<b>Unmodified vs Modification 1</b>), 3 biological replicates, qPCR stability data and d2eGFP Incucyte data.</div>
-      <button class="btn bg bsm" id="btn-load-demo">&#9654; Load Example Dataset</button>
-    </div>
-  </div>
-  <div id="setup-step-2" style="display:none">
-    <div class="card">
-      <div class="ch"><div><div class="ct">Construct Definitions</div></div></div>
-      <div class="ib">The first construct is the reference for cross-assay comparisons.</div>
-      <div style="margin-top:16px">
-        <label>Add Construct</label>
-        <div class="tir"><input type="text" id="construct-input" placeholder="e.g. Unmodified, m1Psi..." style="flex:1"/><button class="btn bs bsm" id="btn-add-construct">Add</button></div>
-        <div id="construct-tags" style="margin-top:8px;min-height:36px"></div>
-      </div>
-      <div class="ib" style="margin-top:14px">
-        <b>Presets:</b>
-        <button class="btn bg bsm" style="margin:4px" id="preset-1">m1Psi / m5C</button>
-        <button class="btn bg bsm" style="margin:4px" id="preset-2">4-construct</button>
-        <button class="btn bg bsm" style="margin:4px" id="preset-3">Cap screen</button>
-      </div>
-    </div>
-    <div class="br"><button class="btn bg" id="btn-s2-back">Back</button><button class="btn bp" id="btn-s2-next">Continue</button></div>
-  </div>
-  <div id="setup-step-3" style="display:none">
-    <div class="card">
-      <div class="ch"><div><div class="ct">Assay Modules</div></div></div>
-      <div class="mc-box" id="mod-qpcr">
-        <label class="cr" style="margin-bottom:10px"><input type="checkbox" id="enable-qpcr"/> <span>qPCR - mRNA Stability</span></label>
-        <div id="qpcr-opts" style="display:none">
-          <div class="fr">
-            <div class="fg"><label>Biological Replicates</label><input type="number" id="qpcr-brep" value="3" min="1" max="12"/></div>
-            <div class="fg"><label>Technical Replicates</label><input type="number" id="qpcr-trep" value="1" min="1" max="4"/></div>
-          </div>
-          <div class="fg"><label>Timepoints (h), comma-separated</label><input type="text" id="qpcr-tp" placeholder="e.g. 4, 8, 12, 24, 48"/></div>
-          <div class="fg"><label>Reference Timepoint (h) - RQ = 1.0</label><input type="number" id="qpcr-ref-tp" value="4" min="0" step="0.5"/></div>
-          <div class="ib">Enter pre-calculated RQ values with RQ(t0)=1.0. No re-normalisation applied.</div>
-        </div>
-      </div>
-      <div class="mc-box" id="mod-gfp" style="margin-top:10px">
-        <label class="cr" style="margin-bottom:10px"><input type="checkbox" id="enable-gfp"/> <span>GFP Incucyte - Continuous Protein Output</span></label>
-        <div id="gfp-opts" style="display:none">
-          <div class="fr">
-            <div class="fg"><label>Biological Replicates</label><input type="number" id="gfp-brep" value="3" min="1"/></div>
-            <div class="fg"><label>Measurement Interval (h)</label><input type="number" id="gfp-interval" value="2" min="0.25" step="0.25"/></div>
-          </div>
-          <div class="fr">
-            <div class="fg"><label>Start Time (h)</label><input type="number" id="gfp-start" value="0" min="0" step="0.5"/></div>
-            <div class="fg"><label>End Time (h)</label><input type="number" id="gfp-end" value="72" min="1"/></div>
-          </div>
-          <div class="fg"><label>Signal Type</label>
-            <select id="gfp-signal"><option>Green Calibrated Units (GCU)</option><option>Total Integrated Intensity</option><option>Mean Intensity</option></select>
-          </div>
-        </div>
-      </div>
-      <div class="mc-box" id="mod-nluc" style="margin-top:10px">
-        <label class="cr" style="margin-bottom:10px"><input type="checkbox" id="enable-nluc"/> <span>NLuc Clariostar - Discrete Luminescence</span></label>
-        <div id="nluc-opts" style="display:none">
-          <div class="fr">
-            <div class="fg"><label>Biological Replicates</label><input type="number" id="nluc-brep" value="3" min="1"/></div>
-            <div class="fg"><label>Timepoints (h)</label><input type="text" id="nluc-tp" placeholder="e.g. 6, 12, 24, 48, 72"/></div>
-          </div>
-          <div class="fg"><label>Assay Conditions</label><input type="text" id="nluc-cond" placeholder="e.g. NanoGlo, 37 C"/></div>
-        </div>
-      </div>
-    </div>
-    <div class="br"><button class="btn bg" id="btn-s3-back">Back</button><button class="btn bp" id="btn-s3-next">Continue</button></div>
-  </div>
-  <div id="setup-step-4" style="display:none">
-    <div class="card"><div class="ch"><div><div class="ct">Summary</div></div></div><div id="setup-summary"></div></div>
-    <div class="br"><button class="btn bg" id="btn-s4-back">Back</button><button class="btn bsuc" id="btn-s4-confirm">Confirm and Generate Template</button></div>
-  </div>
-</div>
+export default function App() {
+  const [step, setStep] = useState(0);
+  const [files, setFiles] = useState([]);
+  const [parseErrors, setParseErrors] = useState([]);
+  const [expName, setExpName] = useState("");
+  const [expDate, setExpDate] = useState("");
+  const [assayType, setAssayType] = useState("OAS activity (A580)");
+  const [notes, setNotes] = useState("");
+  const [timepoints, setTimepoints] = useState(DEFAULT_TIMEPOINTS.join(", "));
+  const [mappings, setMappings] = useState([]);
+  const [chartMode, setChartMode] = useState("corrected");
+  const [showSD, setShowSD] = useState(true);
+  const [hiddenConds, setHiddenConds] = useState({});
+  const [condColors, setCondColors] = useState({});
+  const [activeTab, setActiveTab] = useState("chart");
+  const [modal, setModal] = useState(null);
+  const [showFitCurves, setShowFitCurves] = useState(true);
 
-<!-- TEMPLATE -->
-<div id="view-template" class="view">
-  <div class="pt">Excel Template</div><div class="ps">Personalised data entry template.</div>
-  <div class="card">
-    <div class="ch"><div><div class="ct">Template Structure</div></div><span class="badge bl" id="tmpl-status">Not yet generated</span></div>
-    <div id="tmpl-sheets-info"><div class="ib">Complete Experiment Setup first.</div></div>
-    <hr class="sep"/>
-    <div id="tmpl-dl-area" style="display:none">
-      <div class="ib ok" style="margin-bottom:16px">Template ready. Both 1.01 and 1,01 accepted as decimal formats.</div>
-      <button class="btn bsuc" id="btn-dl-template">Download Excel Template</button>
-    </div>
-  </div>
-</div>
-
-<!-- UPLOAD -->
-<div id="view-upload" class="view">
-  <div class="pt">Data Upload and Validation</div><div class="ps">Upload completed Excel file. Both . and , accepted as decimal separators.</div>
-  <div class="card">
-    <div class="uz" id="upload-zone">
-      <div style="font-size:36px;margin-bottom:12px">&#128193;</div>
-      <div style="font-size:14px;font-weight:700">Drop Excel file here or click to browse</div>
-      <div style="font-size:12px;color:var(--tm);margin-top:6px">Accepts .xlsx</div>
-    </div>
-    <input type="file" id="file-input" accept=".xlsx" style="display:none"/>
-    <div id="upload-status" style="margin-top:16px"></div>
-  </div>
-  <div class="card" id="validation-card" style="display:none">
-    <div class="ch"><div><div class="ct">Validation Report</div></div><span id="val-badge" class="badge"></span></div>
-    <ul class="vl" id="val-list"></ul>
-    <div class="br" id="val-btn-row" style="display:none"><button class="btn bp" id="btn-run-analysis">Run Analysis</button></div>
-  </div>
-</div>
-
-<!-- ANALYSIS -->
-<div id="view-analysis" class="view">
-  <div class="pt">Analysis Pipeline</div><div class="ps">Kinetic analysis across all enabled assay modules.</div>
-  <div class="card">
-    <div class="ch"><div><div class="ct">Pipeline Status</div></div></div>
-    <div id="analysis-progress-area"><div class="ib">Upload and validate data first, then click Run Analysis.</div></div>
-  </div>
-  <div class="card" id="qpcr-result-card" style="display:none">
-    <div class="ch"><div><div class="ct">qPCR - mRNA Decay</div><div class="cs">Exponential decay per replicate</div></div><span class="badge bt">Direct mRNA readout</span></div>
-    <div class="sg" id="qpcr-stats"></div>
-    <div class="pw"><canvas id="qpcr-chart" height="200"></canvas></div>
-    <div class="br" style="margin-top:14px"><span class="ft" id="ft-qpcr">f Formulas</span><button class="btn bg bsm" id="wiki-btn-qpcr">Wiki</button></div>
-    <div class="fb" id="f-qpcr">
-      <div class="fe">RQ(t) = exp( -k_m * (t - t0) )</div><div class="fe">t_half = ln(2) / k_m</div>
-      <div class="fv"><b>k_m</b> fitted per replicate | <b>t_half</b> apparent from t0</div>
-    </div>
-    <div class="ib" style="margin-top:12px">Half-life is apparent from t0. Pre-transfection decay is not captured.</div>
-    <div style="margin-top:16px"><div style="font-weight:700;font-size:13px;margin-bottom:8px">Parameter Table</div><div id="qpcr-table"></div></div>
-  </div>
-  <div class="card" id="gfp-result-card" style="display:none">
-    <div class="ch"><div><div class="ct">GFP Incucyte - Protein Output</div><div class="cs">AUC - Peak - Time to peak</div></div><span class="badge ba">Indirect readout</span></div>
-    <div class="sg" id="gfp-stats"></div>
-    <div class="pw"><canvas id="gfp-chart" height="200"></canvas></div>
-    <div class="br" style="margin-top:14px"><span class="ft" id="ft-gfp">f Formulas</span><button class="btn bg bsm" id="wiki-btn-gfp">Wiki</button></div>
-    <div class="fb" id="f-gfp"><div class="fe">AUC = sum_i (t_i+1 - t_i) * (S_i + S_i+1) / 2</div></div>
-    <div class="ib warn" style="margin-top:12px">GFP AUC reflects stability, translation, and protein turnover jointly. Use the Mechanistic Model to disentangle them.</div>
-    <div style="margin-top:16px"><div id="gfp-table"></div></div>
-  </div>
-  <div class="card" id="nluc-result-card" style="display:none">
-    <div class="ch"><div><div class="ct">NLuc - Luminescence</div></div><span class="badge bro">Indirect readout</span></div>
-    <div class="sg" id="nluc-stats"></div>
-    <div class="pw"><canvas id="nluc-chart" height="200"></canvas></div>
-    <div class="br" style="margin-top:14px"><span class="ft" id="ft-nluc">f Formulas</span></div>
-    <div class="fb" id="f-nluc"><div class="fe">AUC = sum_i (t_i+1 - t_i) * (RLU_i + RLU_i+1) / 2</div></div>
-    <div class="ib warn" style="margin-top:12px">Trapezoidal AUC error scales with timepoint spacing.</div>
-    <div style="margin-top:16px"><div id="nluc-table"></div></div>
-  </div>
-  <div class="card" id="integrated-card" style="display:none">
-    <div class="ch"><div><div class="ct">Integrated Cross-Assay Comparison</div></div><span class="badge bl">Multi-assay</span></div>
-    <div class="pw"><canvas id="integrated-chart" height="200"></canvas></div>
-    <div class="ib" style="margin-top:12px">Normalised to reference construct.</div>
-    <div style="margin-top:16px"><div id="integrated-table"></div></div>
-  </div>
-</div>
-
-<!-- MECHANISTIC -->
-<div id="view-mechanistic" class="view">
-  <div class="pt">Mechanistic Model</div>
-  <div class="ps">ODE-based mechanistic analysis. d2eGFP: full 3-state ODE. secNLuc: rate model derived from the same ODE with λ_fluor = 0.</div>
-  <div class="card mc">
-    <div class="ch">
-      <div><div class="ct">Model Configuration</div><div class="cs">λ_RNA fixed from qPCR per replicate. k_mat and λ_fluor from literature. k_trans fitted per replicate by MAE.</div></div>
-      <span class="badge bind">ODE</span>
-    </div>
-    <div class="fg">
-      <label>Reporter dataset for fitting</label>
-      <select id="mech-reporter">
-        <option value="gfp">GFP Incucyte (d2eGFP) — 3-state ODE</option>
-        <option value="nluc">NLuc Clariostar (secNLuc) — rate model</option>
-      </select>
-    </div>
-    <div id="mech-nluc-note" class="ib ind" style="display:none;margin-top:4px;margin-bottom:4px">
-      <b>secNLuc rate model:</b> Values = protein secreted per 2h collection window at time t.
-      Signal starts at 0, rises to a peak, then falls — described by the inactive-protein compartment of the ODE (λ_fluor = 0):
-      <b>signal(t) = k_trans × k_mat / (k_mat − λ_RNA) × (e<sup>−λ_RNA·t</sup> − e<sup>−k_mat·t</sup>)</b><br/>
-      <b>t_half_mat controls peak timing.</b> Peak occurs at t_peak = ln(k_mat/λ_RNA) / (k_mat − λ_RNA).
-      Adjust t_half_mat so the model peak matches the observed peak. λ_fluor is not used for NLuc.
-    </div>
-    <div style="background:var(--ind50);border:1px solid var(--ind200);border-radius:var(--rs);padding:14px 16px;margin-bottom:16px;margin-top:8px">
-      <div style="font-size:12px;font-weight:700;color:var(--ind700);margin-bottom:10px">Fixed Protein Kinetic Parameters</div>
-      <div class="fr" style="margin-bottom:0">
-        <div class="fg" style="margin-bottom:0">
-          <label>t_half_fluor (h) — active protein decay [GFP only]</label>
-          <input type="number" id="mech-kp-hl" value="2" min="0.1" step="0.1"/>
-          <div style="font-size:11px;color:var(--ind600);margin-top:4px">d2eGFP ≈ 2 h | EGFP ≈ 26 h | not used for NLuc</div>
-        </div>
-        <div class="fg" style="margin-bottom:0">
-          <label>t_half_mat (h) — maturation / secretion lag</label>
-          <input type="number" id="mech-kmat-hl" value="2.5" min="0.05" step="0.05"/>
-          <div style="font-size:11px;color:var(--ind600);margin-top:4px" id="kmat-hint">GFP chromophore maturation ≈ 2–3 h</div>
-        </div>
-      </div>
-    </div>
-    <div class="br"><button class="btn bi" id="btn-run-mech">Run Mechanistic Analysis</button></div>
-    <div class="br" style="margin-top:8px"><span class="ft" id="ft-mech-model">f Model Equations</span></div>
-    <div class="fb" id="f-mech-model">
-      <div style="font-size:13px;font-weight:700;color:var(--ind700);margin-bottom:8px">ODE — Mauger 2019 / Spiewla 2026</div>
-      <div class="fe ind">d[mRNA]/dt     = -λ_RNA × [mRNA]</div>
-      <div class="fe ind">d[inactive]/dt = k_trans × [mRNA]  - k_mat × [inactive]</div>
-      <div class="fe ind">d[fluor]/dt    = k_mat × [inactive] - λ_fluor × [fluor]   ← GFP only</div>
-      <div class="fe ind">signal_NLuc(t) = k_mat × [inactive](t)                    ← NLuc (λ_fluor=0)</div>
-      <div class="fv" style="margin-top:10px">
-        <b style="color:var(--ind700)">λ_RNA</b> — fixed from qPCR per replicate<br/>
-        <b style="color:var(--ind700)">k_trans</b> — sole fitted parameter (MAE minimisation)<br/>
-        <b style="color:var(--ind700)">k_mat</b> = ln(2) / t_half_mat | <b style="color:var(--ind700)">λ_fluor</b> = ln(2) / t_half_fluor (GFP only)
-      </div>
-    </div>
-  </div>
-  <div id="mech-results-area"><div class="ib ind">Run the standard Analysis pipeline first, then click Run Mechanistic Analysis.</div></div>
-</div>
-
-<!-- RESULTS -->
-<div id="view-results" class="view">
-  <div class="pt">Results Summary</div><div class="ps">Consolidated parameter tables from all active modules.</div>
-  <div class="card"><div class="ct" style="margin-bottom:14px">Parameter Overview</div><div id="results-table-area"><div class="ib">Run analysis first.</div></div></div>
-  <div class="card"><div class="ct" style="margin-bottom:10px">Statistical Notes</div>
-    <p style="font-size:13px;color:var(--ts);line-height:1.8">Fits are performed per biological replicate. Group parameters are derived from the replicate distribution. With n less than 3, only descriptive statistics are reported.</p>
-  </div>
-</div>
-
-
-
-<!-- EXPORT -->
-<div id="view-export" class="view">
-  <div class="pt">Export Charts</div>
-  <div class="ps">Download all generated charts as PNG images.</div>
-  <div class="card">
-    <div class="ch"><div><div class="ct">Available Charts</div><div class="cs">Only charts from completed analysis steps are shown.</div></div>
-      <button class="btn bp" id="btn-export-all">&#8681; Download All</button>
-    </div>
-    <div id="export-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px">
-      <div class="ib">Run Analysis (and optionally Mechanistic Model) first to generate charts.</div>
-    </div>
-  </div>
-</div>
-
-<!-- WIKI -->
-<div id="view-wiki" class="view">
-  <div class="pt">Analysis Wiki</div><div class="ps">Methodological reference suitable for thesis defence.</div>
-  <div class="wtoc">
-    <span class="wl" id="wtoc-1">Overview</span><span class="wl" id="wtoc-2">Preprocessing</span>
-    <span class="wl" id="wtoc-3">qPCR</span><span class="wl" id="wtoc-4">GFP</span>
-    <span class="wl" id="wtoc-5">NLuc</span><span class="wl" id="wtoc-6">Integrated</span>
-    <span class="wl ind" id="wtoc-7">Mechanistic Model</span><span class="wl" id="wtoc-8">Statistics</span><span class="wl" id="wtoc-9">Limitations</span>
-  </div>
-  <div class="card">
-    <div id="wiki-overview" class="ws"><h3>1. Overview</h3><p>Three orthogonal assays: qPCR (direct mRNA), GFP Incucyte (continuous protein), NLuc Clariostar (discrete protein). The Mechanistic Model disentangles mRNA stability from translation efficiency.</p></div>
-    <hr class="sep"/>
-    <div id="wiki-preproc" class="ws"><h3>2. Preprocessing</h3><p>qPCR: pre-calculated RQ values, RQ(t0)=1.0 per replicate. No re-normalisation. Technical replicates averaged before fitting.</p></div>
-    <hr class="sep"/>
-    <div id="wiki-qpcr" class="ws"><h3>3. qPCR - mRNA Stability</h3><div class="wf">RQ(t) = exp(-k_m*(t-t0)) &nbsp; t_half = ln(2)/k_m</div><p>First-order decay. k_m fitted per biological replicate. Apparent half-life from t0 only.</p></div>
-    <hr class="sep"/>
-    <div id="wiki-gfp" class="ws"><h3>4. GFP Incucyte</h3><p>AUC by trapezoidal rule. d2EGFP t_half ~2 h. GFP signal convolves stability, translation, and turnover. Use the Mechanistic Model for decomposition.</p></div>
-    <hr class="sep"/>
-    <div id="wiki-nluc" class="ws"><h3>5. NLuc Clariostar</h3><p>Discrete-timepoint trapezoidal AUC. For mechanistic analysis, values are interpreted as secretion rates per 2h collection window.</p></div>
-    <hr class="sep"/>
-    <div id="wiki-integrated" class="ws"><h3>6. Integrated Analysis</h3><p>Parameters normalised to reference construct. Concordant increases in relative t_half and AUC support stability-driven enhancement.</p></div>
-    <hr class="sep"/>
-    <div id="wiki-mech" class="ws">
-      <h3 class="ind">7. Mechanistic Model</h3>
-      <p><b>d2eGFP — 3-state ODE (Mauger 2019 / Spiewla 2026):</b></p>
-      <div class="wf ind">d[mRNA]/dt = -λ_RNA*mRNA | d[inactive]/dt = k_trans*mRNA - k_mat*inactive | d[fluor]/dt = k_mat*inactive - λ_fluor*fluor</div>
-      <p>λ_RNA fixed per replicate from qPCR. k_mat and λ_fluor fixed from literature. k_trans fitted by MAE minimisation.</p>
-      <p><b>secNLuc — rate model (λ_fluor = 0):</b> Values = protein secreted per 2h window = secretion rate ∝ k_mat × [inactive](t). Since secreted NLuc is stable (λ_fluor = 0), the signal is:</p>
-      <div class="wf ind">signal(t) = k_trans × k_mat/(k_mat − λ_RNA) × (exp(−λ_RNA·t) − exp(−k_mat·t))</div>
-      <p>This naturally starts at 0, rises to a peak at t_peak = ln(k_mat/λ_RNA)/(k_mat − λ_RNA), then falls. t_half_mat controls the peak timing — adjust it to match the observed peak.</p>
-      <p><b>AICc comparison:</b> Model 1 (shared k_trans) vs Model 2 (per-construct k_trans). ΔAIC > 2 supports construct-specific translation.</p>
-    </div>
-    <hr class="sep"/>
-    <div id="wiki-stats" class="ws"><h3>8. Statistics</h3><p>Fits per biological replicate. With n &lt; 3, descriptive statistics only.</p></div>
-    <hr class="sep"/>
-    <div id="wiki-limits" class="ws"><h3>9. Limitations</h3>
-      <ul>
-        <li>First-order decay assumes negligible de novo transcription</li>
-        <li>No correction for cell number, viability, or transfection efficiency</li>
-        <li>k_trans absorbs [mRNA](0); transfection efficiency differences not corrected</li>
-        <li>For NLuc: t_half_mat must be tuned manually to match peak timing</li>
-      </ul>
-    </div>
-  </div>
-</div>
-
-</main>
-</div>
-
-<script>
-(function(){
-'use strict';
-
-// ================================================================
-// UTILITIES
-// ================================================================
-function parseNum(v){if(v===null||v===undefined||v==='')return NaN;if(typeof v==='number')return v;return parseFloat(String(v).replace(',','.'));}
-function mean(arr){return arr.length?arr.reduce(function(a,b){return a+b;},0)/arr.length:0;}
-function sd(arr){if(arr.length<2)return 0;var m=mean(arr);return Math.sqrt(arr.reduce(function(a,b){return a+(b-m)*(b-m);},0)/(arr.length-1));}
-function trapz(x,y){var auc=0;for(var i=0;i<x.length-1;i++){var yi=(y[i]!=null&&!isNaN(y[i]))?y[i]:0,yi1=(y[i+1]!=null&&!isNaN(y[i+1]))?y[i+1]:0;auc+=(x[i+1]-x[i])*(yi+yi1)/2;}return auc;}
-function buildTable(headers,rows){var h='<table><thead><tr>'+headers.map(function(x){return'<th>'+x+'</th>';}).join('')+'</tr></thead><tbody>';rows.forEach(function(r){h+='<tr>'+r.map(function(c){return'<td>'+c+'</td>';}).join('')+'</tr>';});return h+'</tbody></table>';}
-function el(id){return document.getElementById(id);}
-function destroyChart(name){if(ST.charts[name]){ST.charts[name].destroy();ST.charts[name]=null;}}
-
-// ================================================================
-// STATE
-// ================================================================
-var ST={constructs:[],modules:{qpcr:false,gfp:false,nluc:false},exp:{title:'',project:'',pi:'',date:'',notes:''},qpcr:{brep:3,trep:1,tp:[],refTp:4},gfp:{brep:3,interval:2,start:0,end:72},nluc:{brep:3,tp:[]},uploadedData:null,analysisResults:null,mechResults:null,charts:{}};
-var COLORS=['#8b5cf6','#14b8a6','#f59e0b','#f43f5e','#6366f1'];
-
-// ================================================================
-// NAVIGATION
-// ================================================================
-['setup','template','upload','analysis','mechanistic','results','export','wiki'].forEach(function(v){
-  el('nav-'+v).addEventListener('click',function(){
-    if(v==='export') renderExportPage();
-    showView(v);
+  // ── Parsing ────────────────────────────────────────────────────────────────
+  const parseExcel = file => new Promise((resolve,reject)=>{
+    const reader=new FileReader();
+    reader.onload=e=>{
+      try{
+        const wb=XLSX.read(e.target.result,{type:"array"});
+        const ws=wb.Sheets[wb.SheetNames[0]];
+        const data=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
+        let hr=-1,hc=-1;
+        for(let r=0;r<data.length;r++){for(let c=0;c<(data[r]||[]).length;c++){if(String(data[r][c]).trim()==="<>"){hr=r;hc=c;break;}}if(hr>=0)break;}
+        if(hr<0){reject(`No "<>" cell in ${file.name}`);return;}
+        const raw8x9=[];
+        for(let ri=0;ri<8;ri++){const row=data[hr+1+ri]||[];raw8x9.push(Array.from({length:9},(_,ci)=>toNum(row[hc+1+ci])));}
+        resolve({name:file.name,raw8x9});
+      }catch(err){reject(String(err));}
+    };
+    reader.readAsArrayBuffer(file);
   });
-});
-function showView(v){
-  document.querySelectorAll('.view').forEach(function(e){e.classList.remove('active');});
-  el('view-'+v).classList.add('active');
-  document.querySelectorAll('.ni').forEach(function(e){e.classList.remove('active');});
-  el('nav-'+v).classList.add('active');
-}
 
-// ================================================================
-// SETUP WIZARD
-// ================================================================
-function setupStep(n){for(var i=1;i<=4;i++){var sec=el('setup-step-'+i),wi=el('wstep-'+i);if(sec)sec.style.display=(i===n)?'':'none';if(wi){wi.className='si';wi.classList.add(i===n?'active':i<n?'done':'locked');}}}
-el('btn-s1').addEventListener('click',function(){var t=el('exp-title').value.trim();if(!t){alert('Please enter an experiment title.');return;}ST.exp.title=t;ST.exp.project=el('exp-project').value.trim();ST.exp.pi=el('exp-pi').value.trim();ST.exp.date=el('exp-date').value.trim();ST.exp.notes=el('exp-notes').value.trim();setupStep(2);});
-el('btn-s2-back').addEventListener('click',function(){setupStep(1);});
-el('btn-s2-next').addEventListener('click',function(){if(ST.constructs.length<1){alert('Add at least one construct.');return;}setupStep(3);});
-el('btn-s3-back').addEventListener('click',function(){setupStep(2);});
-el('btn-s3-next').addEventListener('click',function(){if(!ST.modules.qpcr&&!ST.modules.gfp&&!ST.modules.nluc){alert('Enable at least one assay module.');return;}readModuleParams();renderSummary();setupStep(4);});
-el('btn-s4-back').addEventListener('click',function(){setupStep(3);});
-el('btn-s4-confirm').addEventListener('click',function(){generateTemplatePreview();showView('template');});
-el('btn-add-construct').addEventListener('click',addConstruct);
-el('construct-input').addEventListener('keydown',function(e){if(e.key==='Enter')addConstruct();});
-el('preset-1').addEventListener('click',function(){setPreset(['Unmodified','m1Psi','m5C']);});
-el('preset-2').addEventListener('click',function(){setPreset(['WT','Mod1','Mod2','Mod3']);});
-el('preset-3').addEventListener('click',function(){setPreset(['Control','ARCA-cap','CleanCap-AG']);});
-function addConstruct(){var inp=el('construct-input'),v=inp.value.trim();if(!v)return;if(ST.constructs.indexOf(v)>=0){alert('Name already exists.');return;}ST.constructs.push(v);inp.value='';renderConstructTags();}
-window.removeConstruct=function(i){ST.constructs.splice(i,1);renderConstructTags();};
-function renderConstructTags(){el('construct-tags').innerHTML=ST.constructs.map(function(n,i){return'<span class="ctag">'+n+'<span class="rm" onclick="removeConstruct('+i+')">x</span></span>';}).join('');}
-function setPreset(arr){ST.constructs=arr.slice();renderConstructTags();}
-['qpcr','gfp','nluc'].forEach(function(m){el('enable-'+m).addEventListener('change',function(){ST.modules[m]=this.checked;el(m+'-opts').style.display=this.checked?'':'none';el('mod-'+m).classList.toggle('on',this.checked);});});
-function readModuleParams(){
-  if(ST.modules.qpcr){ST.qpcr.brep=parseInt(el('qpcr-brep').value)||3;ST.qpcr.trep=parseInt(el('qpcr-trep').value)||1;ST.qpcr.tp=el('qpcr-tp').value.split(',').map(function(x){return parseFloat(x.trim());}).filter(function(x){return !isNaN(x);});if(!ST.qpcr.tp.length)ST.qpcr.tp=[4,8,12,24,48];ST.qpcr.refTp=parseFloat(el('qpcr-ref-tp').value)||4;}
-  if(ST.modules.gfp){ST.gfp.brep=parseInt(el('gfp-brep').value)||3;ST.gfp.interval=parseFloat(el('gfp-interval').value)||2;ST.gfp.start=parseFloat(el('gfp-start').value)||0;ST.gfp.end=parseFloat(el('gfp-end').value)||72;}
-  if(ST.modules.nluc){ST.nluc.brep=parseInt(el('nluc-brep').value)||3;ST.nluc.tp=el('nluc-tp').value.split(',').map(function(x){return parseFloat(x.trim());}).filter(function(x){return !isNaN(x);});if(!ST.nluc.tp.length)ST.nluc.tp=[6,12,24,48,72];}
-}
-function renderSummary(){
-  var mods=Object.keys(ST.modules).filter(function(k){return ST.modules[k];}).map(function(k){return k.toUpperCase();}).join(', ');
-  var html='<div class="fr"><div><div class="sl">Title</div><div style="font-weight:700">'+ST.exp.title+'</div></div><div><div class="sl">Constructs</div><div style="font-weight:700">'+ST.constructs.join(', ')+'</div></div></div><div><div class="sl">Modules</div><div style="font-weight:700">'+mods+'</div></div>';
-  if(ST.modules.qpcr)html+='<div class="ib" style="margin-top:12px"><b>qPCR:</b> '+ST.qpcr.brep+' bio x '+ST.qpcr.trep+' tech | '+ST.qpcr.tp.join(', ')+' h</div>';
-  if(ST.modules.gfp)html+='<div class="ib" style="margin-top:8px"><b>GFP:</b> '+ST.gfp.brep+' bio | '+ST.gfp.start+'-'+ST.gfp.end+' h every '+ST.gfp.interval+' h</div>';
-  if(ST.modules.nluc)html+='<div class="ib" style="margin-top:8px"><b>NLuc:</b> '+ST.nluc.brep+' bio | '+ST.nluc.tp.join(', ')+' h</div>';
-  el('setup-summary').innerHTML=html;
-}
-
-// ================================================================
-// FORMULA TOGGLES
-// ================================================================
-['qpcr','gfp','nluc','mech-model'].forEach(function(id){var b=el('ft-'+id);if(b)b.addEventListener('click',function(){el('f-'+id).classList.toggle('open');});});
-var wikiTargets=['overview','preproc','qpcr','gfp','nluc','integrated','mech','stats','limits'];
-for(var wi=1;wi<=9;wi++){(function(idx){el('wtoc-'+idx).addEventListener('click',function(){showView('wiki');setTimeout(function(){var t=el('wiki-'+wikiTargets[idx-1]);if(t)t.scrollIntoView({behavior:'smooth',block:'start'});},100);});
-})(wi);}
-el('wiki-btn-qpcr').addEventListener('click',function(){showView('wiki');setTimeout(function(){el('wiki-qpcr').scrollIntoView({behavior:'smooth',block:'start'});},100);});
-el('wiki-btn-gfp').addEventListener('click',function(){showView('wiki');setTimeout(function(){el('wiki-gfp').scrollIntoView({behavior:'smooth',block:'start'});},100);});
-
-// Reporter selector: update defaults and note visibility
-el('mech-reporter').addEventListener('change',function(){
-  var isN=this.value==='nluc';
-  el('mech-nluc-note').style.display=isN?'':'none';
-  if(isN){
-    el('mech-kmat-hl').value=10;
-    el('kmat-hint').textContent='NLuc: controls peak timing. t_peak=ln(k_mat/\u03bb_RNA)/(k_mat-\u03bb_RNA). Try 8-15 h.';
-  } else {
-    el('mech-kmat-hl').value=0.5;
-    el('kmat-hint').textContent='GFP chromophore maturation \u2248 0.5\u20131 h';
-  }
-});
-
-// ================================================================
-// EXCEL TEMPLATE
-// ================================================================
-function generateTemplatePreview(){
-  var sheets=['Metadata'];
-  if(ST.modules.qpcr)sheets.push('qPCR_raw');
-  if(ST.modules.gfp)sheets.push('GFP_Incucyte_raw');
-  if(ST.modules.nluc)sheets.push('NLuc_raw');
-  sheets.push('Instructions');
-  el('tmpl-status').textContent='Ready';el('tmpl-status').className='badge bt';
-  var html='<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px">';
-  var icons={Metadata:'Meta',qPCR_raw:'qPCR',GFP_Incucyte_raw:'GFP',NLuc_raw:'NLuc',Instructions:'Info'};
-  sheets.forEach(function(s){html+='<div style="background:var(--lav50);border:1px solid var(--lav200);border-radius:var(--rs);padding:8px 14px;font-size:12px;font-weight:700;color:var(--lav700)">'+(icons[s]||s)+'</div>';});
-  html+='</div><p style="font-size:13px;color:var(--ts)">'+sheets.length+' sheets, '+ST.constructs.length+' construct(s)</p>';
-  el('tmpl-sheets-info').innerHTML=html;el('tmpl-dl-area').style.display='';
-}
-el('btn-dl-template').addEventListener('click',function(){
-  var wb=XLSX.utils.book_new();
-  var meta=[['mRNA Stability Analyser Template'],[''],['Title',ST.exp.title],['Project',ST.exp.project||'-'],['PI',ST.exp.pi||'-'],['Date',ST.exp.date||'-'],['Constructs',ST.constructs.join('; ')],['N',ST.constructs.length],['Modules',Object.keys(ST.modules).filter(function(k){return ST.modules[k];}).join(', ')]];
-  if(ST.modules.qpcr)meta.push(['qPCR BioReps',ST.qpcr.brep],['qPCR TechReps',ST.qpcr.trep],['qPCR Tp',ST.qpcr.tp.join(', ')],['qPCR RefTp',ST.qpcr.refTp]);
-  if(ST.modules.gfp)meta.push(['GFP BioReps',ST.gfp.brep],['GFP Range',ST.gfp.start+'-'+ST.gfp.end],['GFP Interval',ST.gfp.interval]);
-  if(ST.modules.nluc)meta.push(['NLuc BioReps',ST.nluc.brep],['NLuc Tp',ST.nluc.tp.join(', ')]);
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(meta),'Metadata');
-  if(ST.modules.qpcr){
-    var hdr=['Timepoint_h'];ST.constructs.forEach(function(c){for(var r=1;r<=ST.qpcr.brep;r++)for(var t=1;t<=ST.qpcr.trep;t++)hdr.push(c+'_BioRep'+r+(ST.qpcr.trep>1?'_TechRep'+t:''));});
-    var rows=[hdr];ST.qpcr.tp.forEach(function(tp){var row=[tp];ST.constructs.forEach(function(){for(var i=0;i<ST.qpcr.brep*ST.qpcr.trep;i++)row.push('');});rows.push(row);});
-    rows.push(['','NOTE: Pre-calculated RQ values. RQ(t0)=1.0. Accepts 1.01 and 1,01.']);
-    XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(rows),'qPCR_raw');
-  }
-  if(ST.modules.gfp){
-    var hdr2=['Time_h'];ST.constructs.forEach(function(c){for(var r=1;r<=ST.gfp.brep;r++)hdr2.push(c+'_BioRep'+r);});
-    var rows2=[hdr2];for(var t=ST.gfp.start;t<=ST.gfp.end+0.001;t+=ST.gfp.interval){var row2=[parseFloat(t.toFixed(4))];ST.constructs.forEach(function(){for(var r=0;r<ST.gfp.brep;r++)row2.push('');});rows2.push(row2);}
-    rows2.push(['','NOTE: GFP signal. Accepts . and ,']);
-    XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(rows2),'GFP_Incucyte_raw');
-  }
-  if(ST.modules.nluc){
-    var hdr3=['Timepoint_h'];ST.constructs.forEach(function(c){for(var r=1;r<=ST.nluc.brep;r++)hdr3.push(c+'_BioRep'+r);});
-    var rows3=[hdr3];ST.nluc.tp.forEach(function(tp){var row3=[tp];ST.constructs.forEach(function(){for(var r=0;r<ST.nluc.brep;r++)row3.push('');});rows3.push(row3);});
-    rows3.push(['','NOTE: NLuc RLU. Accepts . and ,']);
-    XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(rows3),'NLuc_raw');
-  }
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet([['INSTRUCTIONS'],[''],['1. Do not rename sheets or change headers.'],['2. qPCR: pre-calculated RQ; first timepoint=1.0.'],['3. Both 1.01 and 1,01 accepted.'],['4. Leave blank for missing data.'],['5. Save as .xlsx and upload.']]),'Instructions');
-  XLSX.writeFile(wb,'mRNA_Analyser_Template_'+(ST.exp.title||'experiment').replace(/\s+/g,'_')+'.xlsx');
-});
-
-// ================================================================
-// UPLOAD & VALIDATION
-// ================================================================
-var uz=el('upload-zone');
-uz.addEventListener('click',function(){el('file-input').click();});
-uz.addEventListener('dragover',function(e){e.preventDefault();this.classList.add('drag');});
-uz.addEventListener('dragleave',function(){this.classList.remove('drag');});
-uz.addEventListener('drop',function(e){e.preventDefault();this.classList.remove('drag');var f=e.dataTransfer.files[0];if(f)processFile(f);});
-el('file-input').addEventListener('change',function(){if(this.files[0])processFile(this.files[0]);});
-function processFile(file){
-  if(!file.name.endsWith('.xlsx')){el('upload-status').innerHTML='<div class="ib err">Error: .xlsx only.</div>';return;}
-  el('upload-status').innerHTML='<div class="ib">Reading file...</div>';
-  var reader=new FileReader();
-  reader.onload=function(e){try{var wb=XLSX.read(e.target.result,{type:'array'});ST.uploadedData=wb;validate(wb);}catch(err){el('upload-status').innerHTML='<div class="ib err">Error: '+err.message+'</div>';}};
-  reader.readAsArrayBuffer(file);
-}
-function validate(wb){
-  var issues=[],names=wb.SheetNames;
-  function ok(m){issues.push({level:'ok',msg:m});}
-  function err(m){issues.push({level:'err',msg:m});}
-  function warn(m){issues.push({level:'warn',msg:m});}
-  ok('File contains '+names.length+' sheets: '+names.join(', '));
-  if(!names.includes('Metadata'))err('Missing sheet: Metadata');else ok('Metadata found');
-  if(ST.modules.qpcr){
-    if(!names.includes('qPCR_raw')){err('Missing sheet: qPCR_raw');}
-    else{var data=XLSX.utils.sheet_to_json(wb.Sheets['qPCR_raw'],{header:1,defval:''});if(data.length<2){err('qPCR_raw: empty');}else{var exp=1+ST.constructs.length*ST.qpcr.brep*ST.qpcr.trep;if(data[0].length<exp)warn('qPCR_raw: expected >='+exp+' cols, found '+data[0].length);else ok('qPCR_raw: columns match');var nonNum=0;for(var r=1;r<data.length-1;r++)for(var c=1;c<data[0].length;c++)if(data[r][c]!==''&&isNaN(parseNum(data[r][c])))nonNum++;if(nonNum>0)err('qPCR_raw: '+nonNum+' non-numeric value(s)');else ok('qPCR_raw: all cells numeric or empty');ok('qPCR_raw: '+(data.length-2)+' timepoint rows');}}
-  }
-  if(ST.modules.gfp){
-    if(!names.includes('GFP_Incucyte_raw')){err('Missing: GFP_Incucyte_raw');}
-    else{var gd=XLSX.utils.sheet_to_json(wb.Sheets['GFP_Incucyte_raw'],{header:1,defval:''});if(gd.length<2){err('GFP_Incucyte_raw: empty');}else{ok('GFP_Incucyte_raw: '+(gd.length-2)+' rows');var nn2=0;for(var r2=1;r2<gd.length-1;r2++)for(var c2=1;c2<gd[0].length;c2++)if(gd[r2][c2]!==''&&isNaN(parseNum(gd[r2][c2])))nn2++;if(nn2>0)err('GFP_Incucyte_raw: '+nn2+' non-numeric');else ok('GFP_Incucyte_raw: all cells numeric or empty');}}
-  }
-  if(ST.modules.nluc){if(!names.includes('NLuc_raw'))err('Missing: NLuc_raw');else ok('NLuc_raw: found');}
-  var hasErr=issues.some(function(i){return i.level==='err';});
-  el('upload-status').innerHTML='<div class="ib '+(hasErr?'':'ok')+'">'+(hasErr?'Issues found':'File read successfully')+'</div>';
-  el('validation-card').style.display='';
-  el('val-badge').textContent=hasErr?'Issues':'Valid';
-  el('val-badge').className='badge '+(hasErr?'bro':'bt');
-  el('val-list').innerHTML=issues.map(function(i){return'<li class="vi v'+i.level+'"><span class="vd"></span><span>'+i.msg+'</span></li>';}).join('');
-  if(!hasErr)el('val-btn-row').style.display='';
-}
-el('btn-run-analysis').addEventListener('click',runAnalysis);
-
-// ================================================================
-// STANDARD ANALYSIS
-// ================================================================
-function runAnalysis(){
-  showView('analysis');
-  el('analysis-progress-area').innerHTML='<div style="font-size:13px;color:var(--ts);margin-bottom:8px">Running...</div><div class="pb"><div class="pf" id="prog" style="width:0%"></div></div>';
-  setTimeout(function(){el('prog').style.width='30%';},200);
-  setTimeout(function(){el('prog').style.width='60%';if(ST.modules.qpcr){var raw=ST.uploadedData&&ST.uploadedData.SheetNames.includes('qPCR_raw')?XLSX.utils.sheet_to_json(ST.uploadedData.Sheets['qPCR_raw'],{header:1,defval:''}):null;analyseQPCR(raw);}},600);
-  setTimeout(function(){
-    el('prog').style.width='80%';
-    if(ST.modules.gfp){var raw2=ST.uploadedData&&ST.uploadedData.SheetNames.includes('GFP_Incucyte_raw')?XLSX.utils.sheet_to_json(ST.uploadedData.Sheets['GFP_Incucyte_raw'],{header:1,defval:''}):null;analyseGFP(raw2);}
-    if(ST.modules.nluc){var raw3=ST.uploadedData&&ST.uploadedData.SheetNames.includes('NLuc_raw')?XLSX.utils.sheet_to_json(ST.uploadedData.Sheets['NLuc_raw'],{header:1,defval:''}):null;analyseNLuc(raw3);}
-  },1000);
-  setTimeout(function(){el('prog').style.width='100%';var ar=ST.analysisResults;if(ar&&((ar.qpcr&&ar.gfp)||(ar.qpcr&&ar.nluc)||(ar.gfp&&ar.nluc)))renderIntegrated();el('analysis-progress-area').innerHTML='<div class="ib ok">Analysis complete.</div>';renderResultsSummary();},1400);
-}
-function fitExpDecay(tp,vals){var t0=tp[0],bestKm=0.05,bestErr=Infinity;for(var k=0.001;k<2.5;k+=0.003){var err=0;for(var i=0;i<tp.length;i++){if(vals[i]==null||isNaN(vals[i]))continue;var d=vals[i]-Math.exp(-k*(tp[i]-t0));err+=d*d;}if(err<bestErr){bestErr=err;bestKm=k;}}return{km:bestKm};}
-function readReporterFromExcel(rawData){
-  if(!rawData||rawData.length<2)return null;
-  var tp=[],rows=[];for(var r=1;r<rawData.length;r++){var t=parseNum(rawData[r][0]);if(!isNaN(t))rows.push({row:r,t:t});}
-  if(rows.length<2)return null;
-  rows.forEach(function(e){tp.push(e.t);});
-  var nCols=rawData[0].length-1,series=[];
-  for(var c=0;c<nCols;c++){series.push(rows.map(function(e){var v=parseNum(rawData[e.row][c+1]);return isNaN(v)?null:v;}));}
-  return{tp:tp,series:series};
-}
-function analyseQPCR(rawData){
-  var constructs=ST.constructs,tp=ST.qpcr.tp.slice(),brep=ST.qpcr.brep,trep=ST.qpcr.trep;
-  var repData={};
-  constructs.forEach(function(c,ci){repData[c]=[];for(var r=0;r<brep;r++){var km=Math.log(2)/(12+ci*8);repData[c].push(tp.map(function(t,i){return i===0?1.0:Math.max(0.02,Math.exp(-km*(t-tp[0]))+(Math.random()-0.5)*0.05);}));}});
-  if(rawData&&rawData.length>1){constructs.forEach(function(c,ci){for(var r=0;r<brep;r++){var col=1+ci*brep*trep+r*trep,series=[];for(var row=1;row<rawData.length;row++){var v=parseNum(rawData[row][col]);if(!isNaN(v))series.push(v);else if(series.length>0)series.push(null);}if(series.filter(function(x){return x!==null;}).length>=3)repData[c][r]=series;}});}
-  var results={};
-  constructs.forEach(function(c){var fits=repData[c].map(function(s){return fitExpDecay(tp,s);});var km_vals=fits.map(function(f){return f.km;}).filter(function(k){return k>0&&isFinite(k);});var hl_vals=km_vals.map(function(k){return Math.log(2)/k;});results[c]={km_vals:km_vals,hl_vals:hl_vals,km_mean:mean(km_vals),km_sd:sd(km_vals),hl_mean:mean(hl_vals),hl_sd:sd(hl_vals),repData:repData[c],tp:tp.slice()};});
-  ST.analysisResults=ST.analysisResults||{};ST.analysisResults.qpcr=results;
-  el('qpcr-stats').innerHTML=constructs.map(function(c){var r=results[c];return'<div class="sc"><div class="sl">'+c+'</div><div class="sv">'+r.hl_mean.toFixed(1)+'</div><div class="su">h half-life</div></div>';}).join('');
-  var fitTp=Array.from({length:80},function(_,i){return tp[0]+i*(tp[tp.length-1]-tp[0])/79;});
-  var ds=[];
-  constructs.forEach(function(c,ci){var r=results[c],col=COLORS[ci%COLORS.length];var mv=tp.map(function(_,ti){return mean(r.repData.map(function(rep){return rep[ti];}).filter(function(v){return v!=null&&!isNaN(v);}));});ds.push({label:c,data:tp.map(function(t,i){return{x:t,y:mv[i]};}),borderColor:col,backgroundColor:col,pointRadius:5,showLine:false,type:'scatter'});ds.push({label:c+' fit',data:fitTp.map(function(t){return{x:t,y:Math.exp(-r.km_mean*(t-tp[0]))};}),borderColor:col,borderWidth:2,pointRadius:0,showLine:true,fill:false});});
-  destroyChart('qpcr');ST.charts.qpcr=new Chart(el('qpcr-chart').getContext('2d'),{type:'scatter',data:{datasets:ds},options:{responsive:true,plugins:{legend:{position:'top',labels:{font:{size:11}}}},scales:{x:{type:'linear',title:{display:true,text:'Time (h)'}},y:{title:{display:true,text:'RQ (normalised to t0)'},min:0}}}});
-  el('qpcr-table').innerHTML=buildTable(['Construct','k_m mean (1/h)','k_m SD','t_half mean (h)','t_half SD','N'],constructs.map(function(c){var r=results[c];return[c,r.km_mean.toFixed(4),r.km_sd.toFixed(4),r.hl_mean.toFixed(1),r.hl_sd.toFixed(1),r.km_vals.length];}));
-  el('qpcr-result-card').style.display='';
-}
-function analyseGFP(rawData){
-  var constructs=ST.constructs,brep=ST.gfp.brep;
-  var tp=Array.from({length:Math.round((ST.gfp.end-ST.gfp.start)/ST.gfp.interval)+1},function(_,i){return ST.gfp.start+i*ST.gfp.interval;});
-  var repData={};
-  constructs.forEach(function(c,ci){repData[c]=[];for(var r=0;r<brep;r++){var km=Math.log(2)/(12+ci*8),kp=Math.log(2)/2,sc=3000+ci*800;repData[c].push(tp.map(function(t){return Math.max(0,sc*(km/(km-kp))*(Math.exp(-kp*t)-Math.exp(-km*t))+(Math.random()-0.5)*50);}));}});
-  var parsed=readReporterFromExcel(rawData);
-  if(parsed){tp=parsed.tp;constructs.forEach(function(c,ci){for(var r=0;r<brep;r++){var s=parsed.series[ci*brep+r];if(s&&s.filter(function(x){return x!==null;}).length>=2)repData[c][r]=s;}});}
-  var results={};
-  constructs.forEach(function(c){var reps=repData[c];var mv=tp.map(function(_,ti){return mean(reps.map(function(rep){return rep[ti];}).filter(function(v){return v!=null&&!isNaN(v);}));});var auc=reps.map(function(rep){return trapz(tp,rep);});var peak=reps.map(function(rep){return Math.max.apply(null,rep.filter(function(v){return v!=null&&!isNaN(v);}));});var ttp=reps.map(function(rep){var mx=Math.max.apply(null,rep.filter(function(v){return v!=null;}));return tp[rep.indexOf(mx)];});results[c]={auc_reps:auc,peak_reps:peak,ttp_reps:ttp,auc_mean:mean(auc),auc_sd:sd(auc),peak_mean:mean(peak),ttp_mean:mean(ttp),meanVals:mv,repData:reps,tp:tp.slice()};});
-  ST.analysisResults=ST.analysisResults||{};ST.analysisResults.gfp=results;
-  el('gfp-stats').innerHTML=constructs.map(function(c){var r=results[c];return'<div class="sc"><div class="sl">'+c+'</div><div class="sv">'+(r.auc_mean/1000).toFixed(1)+'k</div><div class="su">AUC (GCU·h)</div></div>';}).join('');
-  destroyChart('gfp');ST.charts.gfp=new Chart(el('gfp-chart').getContext('2d'),{type:'scatter',data:{datasets:constructs.map(function(c,ci){return{label:c,data:results[c].tp.map(function(t,i){return{x:t,y:results[c].meanVals[i]};}),borderColor:COLORS[ci%COLORS.length],backgroundColor:COLORS[ci%COLORS.length]+'22',showLine:true,fill:true,tension:.4,pointRadius:2};})},options:{responsive:true,plugins:{legend:{position:'top',labels:{font:{size:11}}}},scales:{x:{type:'linear',title:{display:true,text:'Time (h)'}},y:{title:{display:true,text:'GFP Signal (GCU)'}}}}});
-  el('gfp-table').innerHTML=buildTable(['Construct','AUC mean','AUC SD','Peak mean','T to peak (h)'],constructs.map(function(c){var r=results[c];return[c,r.auc_mean.toFixed(0),r.auc_sd.toFixed(0),r.peak_mean.toFixed(0),r.ttp_mean.toFixed(1)];}));
-  el('gfp-result-card').style.display='';
-}
-function analyseNLuc(rawData){
-  var constructs=ST.constructs,brep=ST.nluc.brep,tp=ST.nluc.tp.slice();
-  var repData={};
-  constructs.forEach(function(c,ci){repData[c]=[];for(var r=0;r<brep;r++){var km=Math.log(2)/(12+ci*8),kp=0.1,sc=50000+ci*15000;repData[c].push(tp.map(function(t){return Math.max(0,sc*(Math.exp(-kp*t)-Math.exp(-km*t))+(Math.random()-0.5)*1000);}));}});
-  var parsed=readReporterFromExcel(rawData);
-  if(parsed){tp=parsed.tp;constructs.forEach(function(c,ci){for(var r=0;r<brep;r++){var s=parsed.series[ci*brep+r];if(s&&s.filter(function(x){return x!==null;}).length>=2)repData[c][r]=s;}});}
-  var results={};
-  constructs.forEach(function(c){
-    var reps=repData[c];
-    var mv=tp.map(function(_,ti){return mean(reps.map(function(rep){return rep[ti];}).filter(function(v){return v!=null&&!isNaN(v);}));});
-    var auc=reps.map(function(rep){return trapz(tp,rep);});
-    var peak=reps.map(function(rep){return Math.max.apply(null,rep.filter(function(v){return v!=null&&!isNaN(v);}));});
-    // Store repData for mechanistic model access
-    results[c]={auc_reps:auc,peak_reps:peak,auc_mean:mean(auc),auc_sd:sd(auc),peak_mean:mean(peak),meanVals:mv,repData:reps,tp:tp.slice()};
-  });
-  ST.analysisResults=ST.analysisResults||{};ST.analysisResults.nluc=results;
-  el('nluc-stats').innerHTML=constructs.map(function(c){var r=results[c];return'<div class="sc"><div class="sl">'+c+'</div><div class="sv">'+(r.auc_mean/1000).toFixed(0)+'k</div><div class="su">AUC (RLU·h)</div></div>';}).join('');
-  destroyChart('nluc');ST.charts.nluc=new Chart(el('nluc-chart').getContext('2d'),{type:'scatter',data:{datasets:constructs.map(function(c,ci){return{label:c,data:results[c].tp.map(function(t,i){return{x:t,y:results[c].meanVals[i]};}),borderColor:COLORS[ci%COLORS.length],backgroundColor:COLORS[ci%COLORS.length],pointRadius:6,tension:.3,showLine:true};})},options:{responsive:true,plugins:{legend:{position:'top',labels:{font:{size:11}}}},scales:{x:{type:'linear',title:{display:true,text:'Time (h)'}},y:{title:{display:true,text:'NLuc (RLU)'}}}}});
-  el('nluc-table').innerHTML=buildTable(['Construct','AUC mean','AUC SD','Peak'],constructs.map(function(c){var r=results[c];return[c,r.auc_mean.toFixed(0),r.auc_sd.toFixed(0),r.peak_mean.toFixed(0)];}));
-  el('nluc-result-card').style.display='';
-}
-function renderIntegrated(){
-  var ar=ST.analysisResults,constructs=ST.constructs,refC=constructs[0];
-  var rows=constructs.map(function(c){return[c,ar.qpcr?(ar.qpcr[c].hl_mean/ar.qpcr[refC].hl_mean).toFixed(2)+'x':'N/A',ar.gfp?(ar.gfp[c].auc_mean/ar.gfp[refC].auc_mean).toFixed(2)+'x':'N/A',ar.nluc?(ar.nluc[c].auc_mean/ar.nluc[refC].auc_mean).toFixed(2)+'x':'N/A'];});
-  el('integrated-table').innerHTML=buildTable(['Construct','Rel t_half','Rel AUC (GFP)','Rel AUC (NLuc)'],rows);
-  var ds=[];
-  if(ar.qpcr)ds.push({label:'Rel t_half',data:constructs.map(function(c){return ar.qpcr[c].hl_mean/ar.qpcr[refC].hl_mean;}),backgroundColor:COLORS[0]+'99',borderColor:COLORS[0],borderWidth:2});
-  if(ar.gfp)ds.push({label:'Rel AUC GFP',data:constructs.map(function(c){return ar.gfp[c].auc_mean/ar.gfp[refC].auc_mean;}),backgroundColor:COLORS[1]+'99',borderColor:COLORS[1],borderWidth:2});
-  if(ar.nluc)ds.push({label:'Rel AUC NLuc',data:constructs.map(function(c){return ar.nluc[c].auc_mean/ar.nluc[refC].auc_mean;}),backgroundColor:COLORS[2]+'99',borderColor:COLORS[2],borderWidth:2});
-  destroyChart('integrated');ST.charts.integrated=new Chart(el('integrated-chart').getContext('2d'),{type:'bar',data:{labels:constructs,datasets:ds},options:{responsive:true,plugins:{legend:{position:'top',labels:{font:{size:11}}}},scales:{y:{title:{display:true,text:'Fold-change vs '+refC},beginAtZero:true}}}});
-  el('integrated-card').style.display='';
-}
-function renderResultsSummary(){
-  var ar=ST.analysisResults;if(!ar)return;
-  var c=ST.constructs,html='';
-  if(ar.qpcr)html+='<div style="font-weight:700;font-size:13px;margin-bottom:8px">qPCR</div>'+buildTable(['Construct','k_m','k_m SD','t_half (h)','t_half SD'],c.map(function(x){return[x,ar.qpcr[x].km_mean.toFixed(4),ar.qpcr[x].km_sd.toFixed(4),ar.qpcr[x].hl_mean.toFixed(1),ar.qpcr[x].hl_sd.toFixed(1)];}));
-  if(ar.gfp)html+='<div style="font-weight:700;font-size:13px;margin:16px 0 8px">GFP</div>'+buildTable(['Construct','AUC mean','AUC SD','Peak','T to peak'],c.map(function(x){return[x,ar.gfp[x].auc_mean.toFixed(0),ar.gfp[x].auc_sd.toFixed(0),ar.gfp[x].peak_mean.toFixed(0),ar.gfp[x].ttp_mean.toFixed(1)];}));
-  if(ar.nluc)html+='<div style="font-weight:700;font-size:13px;margin:16px 0 8px">NLuc</div>'+buildTable(['Construct','AUC mean','AUC SD','Peak'],c.map(function(x){return[x,ar.nluc[x].auc_mean.toFixed(0),ar.nluc[x].auc_sd.toFixed(0),ar.nluc[x].peak_mean.toFixed(0)];}));
-  if(ST.mechResults){
-    var mr=ST.mechResults,repKey=el('mech-reporter').value;
-    html+='<div style="font-weight:700;font-size:13px;margin:16px 0 8px">Mechanistic Model (reporter: '+repKey.toUpperCase()+')</div>';
-    html+=buildTable(
-      ['Construct','k_trans mean','k_trans SD','Rel k_trans','t\u00bd mRNA (h)','Rel t\u00bd','Interpretation'],
-      c.map(function(x){
-        var refC=c[0],ktRef=mr[refC].kTrans_mean,hlRef=ar.qpcr[refC].hl_mean;
-        var rkt=x===refC?'ref':(mr[x].kTrans_mean/Math.max(ktRef,1e-6)).toFixed(2)+'x';
-        var rhl=x===refC?'ref':(ar.qpcr[x].hl_mean/Math.max(hlRef,1e-6)).toFixed(2)+'x';
-        var rHL=(ar.qpcr[x].hl_mean-hlRef)/hlRef,rKt=(mr[x].kTrans_mean-ktRef)/Math.max(ktRef,1e-6),thr=0.2;
-        var label,cls;
-        if(x===refC){label='Reference';cls='iu';}
-        else if(rHL>thr&&rKt>thr){label='Stability + Translation';cls='im';}
-        else if(rHL>thr&&Math.abs(rKt)<=thr){label='Stability-driven';cls='is';}
-        else if(Math.abs(rHL)<=thr&&rKt>thr){label='Translation-driven';cls='itr';}
-        else if(rHL<-thr&&rKt<-thr){label='Decreased both';cls='im';}
-        else if(rHL<-thr&&Math.abs(rKt)<=thr){label='Stability-driven (dec.)';cls='is';}
-        else if(Math.abs(rHL)<=thr&&rKt<-thr){label='Translation-driven (dec.)';cls='itr';}
-        else{label='Mixed / inconclusive';cls='iu';}
-        return[x,mr[x].kTrans_mean.toFixed(2),mr[x].kTrans_sd.toFixed(2),rkt,ar.qpcr[x].hl_mean.toFixed(1),rhl,'<span class="ic '+cls+'">'+label+'</span>'];
-      })
-    );
-  }
-  el('results-table-area').innerHTML=html||'<div class="ib">No results yet.</div>';
-}
-
-// ================================================================
-// MECHANISTIC MODEL
-// ================================================================
-// --- d2eGFP: full 3-state ODE (Mauger 2019 / Spiewla 2026) ---
-// d[mRNA]/dt    = -lRNA * mRNA
-// d[inactive]/dt = kT * mRNA - kMat * inactive
-// d[fluor]/dt   = kMat * inactive - lFluor * fluor
-// Analytical solution for [fluor](t):
-function fluorModel(t,lRNA,kT,kMat,lFluor){
-  var eps=1e-6;
-  if(Math.abs(lRNA-kMat)>eps&&Math.abs(lRNA-lFluor)>eps&&Math.abs(kMat-lFluor)>eps){
-    var A=kT*kMat;
-    return A/((kMat-lRNA)*(lFluor-lRNA))*Math.exp(-lRNA*t)
-          +A/((lRNA-kMat)*(lFluor-kMat))*Math.exp(-kMat*t)
-          +A/((lRNA-lFluor)*(kMat-lFluor))*Math.exp(-lFluor*t);
-  }
-  // RK4 numerical fallback
-  var h=0.05,mRNA=1,inact=0,fluor=0,steps=Math.round(t/h);
-  for(var i=0;i<steps;i++){var dm=-lRNA*mRNA,di=kT*mRNA-kMat*inact,df=kMat*inact-lFluor*fluor;mRNA+=dm*h;inact+=di*h;fluor+=df*h;}
-  return Math.max(0,fluor);
-}
-// MAE fitter for d2eGFP
-function fitKtransGFP(tp,vals,lRNA,kMat,lFluor){
-  var obs=[];
-  for(var i=0;i<tp.length;i++)if(vals[i]!=null&&!isNaN(vals[i]))obs.push({t:tp[i],v:vals[i]});
-  if(obs.length<2)return{kTrans:NaN,mae:Infinity,n:0,fitted:[]};
-  var maxV=Math.max.apply(null,obs.map(function(p){return p.v;}))||1;
-  var ktMax=maxV*lFluor*(lRNA+kMat)/Math.max(kMat,1e-4)*10;
-  var bestKt=1,bestMae=Infinity;
-  for(var si=1;si<=150;si++){var kt=si/150*ktMax,m=0;obs.forEach(function(p){m+=Math.abs(p.v-fluorModel(p.t,lRNA,kt,kMat,lFluor));});m/=obs.length;if(m<bestMae){bestMae=m;bestKt=kt;}}
-  var step=ktMax/300;
-  for(var di=-60;di<=60;di++){var kt2=Math.max(1e-6,bestKt+di*step),m2=0;obs.forEach(function(p){m2+=Math.abs(p.v-fluorModel(p.t,lRNA,kt2,kMat,lFluor));});m2/=obs.length;if(m2<bestMae){bestMae=m2;bestKt=kt2;}}
-  return{kTrans:bestKt,mae:bestMae,n:obs.length,fitted:tp.map(function(t){return fluorModel(t,lRNA,bestKt,kMat,lFluor);})};
-}
-
-// --- secNLuc: rate model (lambda_fluor = 0) ---
-// Values = protein secreted per 2h collection window = k_mat * [inactive](t)
-// [inactive](t) = k_trans/(kMat-lRNA) * (exp(-lRNA*t) - exp(-kMat*t))
-// => signal(t) = k_trans * kMat/(kMat-lRNA) * (exp(-lRNA*t) - exp(-kMat*t))
-// Starts at 0, rises to peak at t_peak=ln(kMat/lRNA)/(kMat-lRNA), then falls.
-function nlucRateModel(t,lRNA,kT,kMat){
-  if(Math.abs(kMat-lRNA)<1e-6)return kT*kMat*t*Math.exp(-lRNA*t); // limit kMat->lRNA
-  return kT*kMat/(kMat-lRNA)*(Math.exp(-lRNA*t)-Math.exp(-kMat*t));
-}
-// MAE fitter for secNLuc
-function fitKtransNLuc(tp,vals,lRNA,kMat){
-  var obs=[];
-  for(var i=0;i<tp.length;i++)if(vals[i]!=null&&!isNaN(vals[i]))obs.push({t:tp[i],v:vals[i]});
-  if(obs.length<2)return{kTrans:NaN,mae:Infinity,n:0,fitted:[]};
-  var maxV=Math.max.apply(null,obs.map(function(p){return p.v;}))||1;
-  var ktMax=maxV*10; // generous upper bound; peak signal ≈ k_trans * O(1)
-  var bestKt=ktMax/2,bestMae=Infinity;
-  for(var si=1;si<=200;si++){var kt=si/200*ktMax,m=0;obs.forEach(function(p){m+=Math.abs(p.v-nlucRateModel(p.t,lRNA,kt,kMat));});m/=obs.length;if(m<bestMae){bestMae=m;bestKt=kt;}}
-  var step=ktMax/400;
-  for(var di=-80;di<=80;di++){var kt2=Math.max(1e-6,bestKt+di*step),m2=0;obs.forEach(function(p){m2+=Math.abs(p.v-nlucRateModel(p.t,lRNA,kt2,kMat));});m2/=obs.length;if(m2<bestMae){bestMae=m2;bestKt=kt2;}}
-  return{kTrans:bestKt,mae:bestMae,n:obs.length,fitted:tp.map(function(t){return nlucRateModel(t,lRNA,bestKt,kMat);})};
-}
-
-el('btn-run-mech').addEventListener('click',runMechanistic);
-
-function runMechanistic(){
-  var ar=ST.analysisResults;
-  if(!ar||!ar.qpcr){el('mech-results-area').innerHTML='<div class="ib err">qPCR results required. Run Analysis pipeline first.</div>';return;}
-  var repKey=el('mech-reporter').value;
-  var repData=ar[repKey];
-  if(!repData){el('mech-results-area').innerHTML='<div class="ib err">No '+repKey.toUpperCase()+' data. Enable this module and run Analysis first.</div>';return;}
-
-  var tHalfFluor=parseFloat(el('mech-kp-hl').value)||2;
-  var tHalfMat=parseFloat(el('mech-kmat-hl').value)||0.5;
-  var lFluor=Math.log(2)/tHalfFluor;
-  var kMat=Math.log(2)/tHalfMat;
-  var isNluc=(repKey==='nluc');
-  var constructs=ST.constructs,refC=constructs[0];
-
-  // Fit k_trans per construct per replicate
-  var mechRes={};
-  constructs.forEach(function(c){
-    var qr=ar.qpcr[c],rd=repData[c],tp=rd.tp;
-    if(!rd.repData){el('mech-results-area').innerHTML='<div class="ib err">Reporter data missing for '+c+'. Re-run Analysis first.</div>';return;}
-    var repFits=rd.repData.map(function(series,r){
-      var lRNA_r=(qr.km_vals[r]&&isFinite(qr.km_vals[r]))?qr.km_vals[r]:qr.km_mean;
-      if(!series||series.filter(function(x){return x!=null&&!isNaN(x);}).length<2)
-        return{kTrans:NaN,mae:Infinity,n:0,lRNA:lRNA_r,tHalf_mRNA:Math.log(2)/lRNA_r,fitted:[]};
-      var f=isNluc?fitKtransNLuc(tp,series,lRNA_r,kMat):fitKtransGFP(tp,series,lRNA_r,kMat,lFluor);
-      return{kTrans:f.kTrans,mae:f.mae,n:f.n,lRNA:lRNA_r,tHalf_mRNA:Math.log(2)/lRNA_r,fitted:f.fitted};
-    });
-    var ktVals=repFits.map(function(f){return f.kTrans;}).filter(function(x){return !isNaN(x)&&isFinite(x)&&x>0;});
-    mechRes[c]={repFits:repFits,kTrans_vals:ktVals,kTrans_mean:mean(ktVals),kTrans_sd:sd(ktVals),tp:rd.tp,repData:rd.repData};
-  });
-  ST.mechResults=mechRes;
-
-  var lRNAMap={};constructs.forEach(function(c){lRNAMap[c]=ar.qpcr[c].km_mean;});
-
-  // Interpretation
-  var ktRef=mechRes[refC].kTrans_mean,hlRef=ar.qpcr[refC].hl_mean;
-  function interpret(c){
-    if(c===refC)return{label:'Reference',cls:'iu'};
-    var rHL=(ar.qpcr[c].hl_mean-hlRef)/hlRef,rKt=(mechRes[c].kTrans_mean-ktRef)/Math.max(ktRef,1e-6),thr=0.2;
-    if(rHL>thr&&rKt>thr)return{label:'Increased stability + translation',cls:'im'};
-    if(rHL>thr&&Math.abs(rKt)<=thr)return{label:'Stability-driven',cls:'is'};
-    if(Math.abs(rHL)<=thr&&rKt>thr)return{label:'Translation-driven',cls:'itr'};
-    if(rHL<-thr&&rKt<-thr)return{label:'Decreased stability + translation',cls:'im'};
-    if(rHL<-thr&&Math.abs(rKt)<=thr)return{label:'Stability-driven (decreased)',cls:'is'};
-    if(Math.abs(rHL)<=thr&&rKt<-thr)return{label:'Translation-driven (decreased)',cls:'itr'};
-    return{label:'Mixed / inconclusive',cls:'iu'};
-  }
-
-  // Model note for subtitle
-  var tPeakNote='';
-  if(isNluc){var lRefMean=lRNAMap[refC];if(Math.abs(kMat-lRefMean)>1e-6){var tpeak=Math.log(kMat/Math.max(lRefMean,1e-6))/(kMat-lRefMean);tPeakNote=' | model peak ~'+tpeak.toFixed(1)+' h (adjust t_half_mat to match data)';}}
-  var modelNote=isNluc?('secNLuc rate model: k_trans×k_mat/(k_mat−λ_RNA)×(e^{−λ_RNA·t}−e^{−k_mat·t}) | t_half_mat='+tHalfMat+' h'+tPeakNote):('d2eGFP 3-state ODE | t_half_fluor='+tHalfFluor+' h | t_half_mat='+tHalfMat+' h');
-
-  // ---- Build result HTML ----
-  var html='';
-  html+='<div class="card mc"><div class="ch"><div><div class="ct">Mechanistic Fit Results</div><div class="cs">'+modelNote+'</div></div><span class="badge bind">k_trans</span></div>';
-  html+='<div class="sg">';
-  constructs.forEach(function(c){var m=mechRes[c];html+='<div class="sc ind"><div class="sl">'+c+' k_trans</div><div class="sv ind">'+m.kTrans_mean.toFixed(2)+'</div><div class="su">\u00b1 '+m.kTrans_sd.toFixed(2)+' SD (n='+m.kTrans_vals.length+')</div></div>';});
-  html+='</div><div class="sg">';
-  constructs.forEach(function(c){html+='<div class="sc"><div class="sl">'+c+' t\u00bd mRNA</div><div class="sv">'+ar.qpcr[c].hl_mean.toFixed(1)+'</div><div class="su">h (from qPCR)</div></div>';});
-  html+='</div>';
-  html+='<div class="pw"><canvas id="mech-fit-chart" height="220"></canvas></div>';
-  html+='<div class="br" style="margin-top:10px"><span class="ft" id="ft-mech-inline">f Model Equations</span><button class="btn bg bsm" id="wiki-mech-btn">Wiki</button></div>';
-  var eqNote=isNluc?'signal(t)=k_trans\u00d7k_mat/(k_mat\u2212\u03bb_RNA)\u00d7(e^{\u2212\u03bb_RNA\u00b7t}\u2212e^{\u2212k_mat\u00b7t}) | \u03bb_fluor not used':'d[mRNA]/dt=-\u03bb_RNA\u00b7mRNA | d[inactive]/dt=k_trans\u00b7mRNA-k_mat\u00b7inactive | d[fluor]/dt=k_mat\u00b7inactive-\u03bb_fluor\u00b7fluor';
-  html+='<div class="fb" id="f-mech-inline"><div class="fe ind">'+eqNote+'</div></div></div>';
-
-  html+='<div class="card mc"><div class="ch"><div><div class="ct">mRNA Half-life vs k_trans (replicate level)</div></div></div><div class="pw"><canvas id="mech-scatter-chart" height="220"></canvas></div></div>';
-
-  html+='<div class="card mc"><div class="ch"><div><div class="ct">Construct Decomposition</div></div></div>';
-  var decompRows=constructs.map(function(c){
-    var inter=interpret(c);
-    var rhl=c===refC?'ref':(ar.qpcr[c].hl_mean/ar.qpcr[refC].hl_mean).toFixed(2)+'x';
-    var rkt=c===refC?'ref':(mechRes[c].kTrans_mean/Math.max(mechRes[refC].kTrans_mean,1e-6)).toFixed(2)+'x';
-    var rauc=repData[c]?(c===refC?'ref':(repData[c].auc_mean/repData[refC].auc_mean).toFixed(2)+'x'):'N/A';
-    return[c,ar.qpcr[c].hl_mean.toFixed(1)+' h',mechRes[c].kTrans_mean.toFixed(2)+' \u00b1 '+mechRes[c].kTrans_sd.toFixed(2),rhl,rkt,rauc,'<span class="ic '+inter.cls+'">'+inter.label+'</span>'];
-  });
-  html+=buildTable(['Construct','t\u00bd mRNA','k_trans \u00b1 SD','Rel t\u00bd','Rel k_trans','Rel AUC','Interpretation'],decompRows);
-  html+='<div class="ib" style="margin-top:10px">Threshold for biological relevance: 20% deviation. Rel k_trans &gt; 1 = higher translation independent of stability.</div></div>';
-
-
-
-  el('mech-results-area').innerHTML=html;
-  el('ft-mech-inline').addEventListener('click',function(){el('f-mech-inline').classList.toggle('open');});
-  el('wiki-mech-btn').addEventListener('click',function(){showView('wiki');setTimeout(function(){el('wiki-mech').scrollIntoView({behavior:'smooth',block:'start'});},100);});
-
-  // ---- Helper: compute model signal for a given construct ----
-  function modelSignal(t,lRNA_m,ktM){
-    return isNluc?nlucRateModel(t,lRNA_m,ktM,kMat):fluorModel(t,lRNA_m,ktM,kMat,lFluor);
-  }
-
-  // ---- Fit chart ----
-  var fitDs=[];
-  constructs.forEach(function(c,ci){
-    var col=COLORS[ci%COLORS.length],m=mechRes[c],rd2=repData[c],tp2=m.tp;
-    var mv=tp2.map(function(_,ti){return mean(rd2.repData.map(function(rep){return rep[ti];}).filter(function(v){return v!=null&&!isNaN(v);}));});
-    var lRNA_m=ar.qpcr[c].km_mean;
-    var fitted=tp2.map(function(t){return modelSignal(t,lRNA_m,m.kTrans_mean);});
-    fitDs.push({label:c+' obs',data:tp2.map(function(t,i){return{x:t,y:mv[i]};}),borderColor:col,borderDash:[5,3],pointRadius:3,showLine:true,fill:false,tension:.3});
-    fitDs.push({label:c+' fit',data:tp2.map(function(t,i){return{x:t,y:fitted[i]};}),borderColor:col,borderWidth:2.5,pointRadius:0,showLine:true,fill:false,tension:.3});
-  });
-  destroyChart('mech-fit');
-  ST.charts['mech-fit']=new Chart(el('mech-fit-chart').getContext('2d'),{type:'scatter',data:{datasets:fitDs},options:{responsive:true,plugins:{legend:{position:'top',labels:{font:{size:10}}}},scales:{x:{type:'linear',title:{display:true,text:'Time (h)'}},y:{title:{display:true,text:'Reporter signal'}}}}});
-
-  // ---- Scatter: mean ± SD per construct with error bars ----
-  // Custom plugin to draw error bars (no external library needed)
-  var errBarPlugin={
-    id:'errBar',
-    afterDatasetsDraw:function(chart){
-      var ctx=chart.ctx;
-      chart.data.datasets.forEach(function(ds,di){
-        if(!ds._errX&&!ds._errY)return;
-        var meta=chart.getDatasetMeta(di);
-        meta.data.forEach(function(pt,pi){
-          var dx=ds._errX?ds._errX[pi]:0, dy=ds._errY?ds._errY[pi]:0;
-          var col=ds.borderColor||'#888';
-          ctx.save();ctx.strokeStyle=col;ctx.lineWidth=2;
-          var bw=8;
-          if(dx>0){
-            var x0=chart.scales.x.getPixelForValue(ds.data[pi].x-dx);
-            var x1=chart.scales.x.getPixelForValue(ds.data[pi].x+dx);
-            var py=pt.y;
-            ctx.beginPath();ctx.moveTo(x0,py);ctx.lineTo(x1,py);ctx.stroke();
-            ctx.beginPath();ctx.moveTo(x0,py-bw/2);ctx.lineTo(x0,py+bw/2);ctx.stroke();
-            ctx.beginPath();ctx.moveTo(x1,py-bw/2);ctx.lineTo(x1,py+bw/2);ctx.stroke();
-          }
-          if(dy>0){
-            var y0=chart.scales.y.getPixelForValue(ds.data[pi].y-dy);
-            var y1=chart.scales.y.getPixelForValue(ds.data[pi].y+dy);
-            var px=pt.x;
-            ctx.beginPath();ctx.moveTo(px,y0);ctx.lineTo(px,y1);ctx.stroke();
-            ctx.beginPath();ctx.moveTo(px-bw/2,y0);ctx.lineTo(px+bw/2,y0);ctx.stroke();
-            ctx.beginPath();ctx.moveTo(px-bw/2,y1);ctx.lineTo(px+bw/2,y1);ctx.stroke();
-          }
-          ctx.restore();
-        });
-      });
+  const handleFiles=async e=>{
+    const selected=Array.from(e.target.files);
+    const parsed=[],errs=[];
+    for(const f of selected){try{parsed.push(await parseExcel(f));}catch(err){errs.push(err);}}
+    setFiles(parsed);setParseErrors(errs);
+    if(parsed.length>0){
+      const m=[];parsed.forEach((f,fi)=>ROWS.forEach((_,ri)=>m.push({fileIdx:fi,rowIdx:ri,rowLabel:ROWS[ri],condName:"",approach:"",rowNotes:""})));
+      setMappings(m);setStep(1);
     }
   };
-  var scatDs=constructs.map(function(c,ci){
-    var m=mechRes[c],qr=ar.qpcr[c];
-    var col=COLORS[ci%COLORS.length];
-    var hlMean=qr.hl_mean,hlSd=qr.hl_sd,ktMean=m.kTrans_mean,ktSd=m.kTrans_sd;
-    var ds={label:c,data:[{x:hlMean,y:ktMean}],backgroundColor:col+'cc',borderColor:col,
-            pointRadius:9,pointStyle:'circle',type:'scatter',
-            _errX:[hlSd],_errY:[ktSd]};
-    return ds;
-  });
-  destroyChart('mech-scatter');
-  ST.charts['mech-scatter']=new Chart(el('mech-scatter-chart').getContext('2d'),{
-    type:'scatter',
-    data:{datasets:scatDs},
-    options:{responsive:true,plugins:{legend:{position:'top',labels:{font:{size:11}}}},
-             scales:{x:{type:'linear',title:{display:true,text:'mRNA half-life — mean \u00b1 SD (h)'}},
-                     y:{title:{display:true,text:'k_trans — mean \u00b1 SD'}}}},
-    plugins:[errBarPlugin]
-  });
+  const getParsedTPs=()=>timepoints.split(/[,;\s]+/).map(s=>parseFloat(s.replace(",","."))).filter(x=>!isNaN(x));
 
-  // ---- Residuals chart ----
+  // ── Analysis data ──────────────────────────────────────────────────────────
+  const analysisData=useMemo(()=>{
+    if(!files.length||!mappings.length) return null;
+    const tps=getParsedTPs(), n=tps.length;
+    const rows=mappings.filter(m=>m.condName.trim()).map(m=>{
+      const raw=files[m.fileIdx].raw8x9[m.rowIdx].slice(0,n);
+      const base=toNum(raw[0]);
+      return{...m,raw,corrected:raw.map(v=>toNum(v)-base),cond:m.condName.trim()};
+    });
+    const conditions=[...new Set(rows.map(r=>r.cond))];
+    const condMap={};
+    conditions.forEach(c=>{
+      const reps=rows.filter(r=>r.cond===c);
+      const repMeans=tps.map((_,ti)=>{const v=reps.map(r=>r.corrected[ti]).filter(v=>!isNaN(v));return v.length?mean(v):NaN;});
+      const repSDs=tps.map((_,ti)=>{const v=reps.map(r=>r.corrected[ti]).filter(v=>!isNaN(v));return v.length>=2?stdDev(v):0;});
+      condMap[c]={reps,repMeans,repSDs,n:reps.length};
+    });
+    return{tps,rows,conditions,condMap};
+  },[files,mappings,timepoints]);
 
-}
+  const chartData=useMemo(()=>{
+    if(!analysisData) return [];
+    const{tps,conditions,condMap}=analysisData;
+    return tps.map((t,ti)=>{
+      const pt={t};
+      conditions.forEach(c=>{
+        if(chartMode==="mean"){pt[c]=condMap[c].repMeans[ti];pt[`${c}_sd`]=condMap[c].repSDs[ti];}
+        else{condMap[c].reps.forEach((r,ri)=>{const key=condMap[c].n>1?`${c} (rep ${ri+1})`:c;pt[key]=chartMode==="raw"?r.raw[ti]:r.corrected[ti];});}
+      });
+      return pt;
+    });
+  },[analysisData,chartMode]);
 
+  const chartLines=useMemo(()=>{
+    if(!analysisData) return [];
+    const{conditions,condMap}=analysisData;
+    const lines=[];
+    conditions.forEach((c,ci)=>{
+      const color=condColors[c]||PALETTE[ci%PALETTE.length];
+      if(chartMode==="mean"){lines.push({key:c,label:c,color,hasSD:showSD&&condMap[c].n>1,parentCond:c});}
+      else{condMap[c].reps.forEach((_,ri)=>{const key=condMap[c].n>1?`${c} (rep ${ri+1})`:c;lines.push({key,label:key,color,parentCond:c});});}
+    });
+    return lines;
+  },[analysisData,chartMode,showSD,condColors]);
 
+  const isLineHidden=l=>hiddenConds[l.parentCond||l.key]||false;
 
-// ================================================================
-// DEMO / EXAMPLE DATASET
-// Unmodified vs Modification 1 — qPCR + d2eGFP, 3 bio replicates
-// Data injected directly into the existing analysis functions.
-// No changes to analysis logic, fitting, or model.
-// ================================================================
-el('btn-load-demo').addEventListener('click', function() {
+  // ── Curve fit results ──────────────────────────────────────────────────────
+  const fitResults=useMemo(()=>{
+    if(!analysisData) return {};
+    const{tps,conditions,condMap}=analysisData;
+    const res={};
+    conditions.forEach(c=>{res[c]=fitExpAssoc(tps,condMap[c].repMeans);});
+    return res;
+  },[analysisData]);
 
-  // --- Configure ST exactly as setup wizard would ---
-  ST.exp = {title:'Demo: Unmodified vs Modification 1', project:'Example Dataset', pi:'Demo', date:'2026-05-01', notes:'Prebuilt demo. Modification 1 shows improved mRNA stability and higher d2eGFP output.'};
-  ST.constructs = ['Unmodified', 'Modification 1'];
-  ST.modules    = {qpcr: true, gfp: true, nluc: false};
-  ST.qpcr       = {brep: 3, trep: 1, tp: [0, 4, 8, 12, 24, 36, 48], refTp: 0};
-  ST.gfp        = {brep: 3, interval: 4, start: 0, end: 72};
-  ST.nluc       = {brep: 3, tp: []};
-  ST.analysisResults = null;
-  ST.mechResults     = null;
+  // Fine-resolution data for fit chart
+  const fitChartData=useMemo(()=>{
+    if(!analysisData) return [];
+    const{tps,conditions,condMap}=analysisData;
+    const maxT=Math.max(...tps);
+    const fitTs=Array.from({length:61},(_,i)=>+(i*maxT/60).toFixed(2));
+    const allTs=[...new Set([...fitTs,...tps])].sort((a,b)=>a-b);
+    return allTs.map(t=>{
+      const pt={t};
+      const iAct=tps.findIndex(tp=>Math.abs(tp-t)<0.01);
+      conditions.forEach(c=>{
+        const fr=fitResults[c];
+        if(fr&&!fr.error) pt[`${c}_fit`]=+(fr.Amax*(1-Math.exp(-fr.k*t))).toFixed(5);
+        if(iAct>=0){
+          const mv=condMap[c].repMeans[iAct];
+          if(!isNaN(mv)) pt[`${c}_meas`]=mv;
+        }
+      });
+      return pt;
+    });
+  },[analysisData,fitResults]);
 
-  // Small biological noise helper (percentage of value)
-  function jitter(v, pct) { return Math.max(0, v * (1 + (Math.random() - 0.5) * 2 * pct)); }
-
-  // --- qPCR raw data (same array format as XLSX sheet_to_json header:1) ---
-  // Column layout: Timepoint_h | Unmod_R1 R2 R3 | Mod1_R1 R2 R3
-  var qMean = {
-    'Unmodified':    [1.00, 0.72, 0.51, 0.36, 0.18, 0.09, 0.04],
-    'Modification 1':[1.00, 0.91, 0.81, 0.70, 0.52, 0.38, 0.27]
+  // ── Generate SVG for chart export ──────────────────────────────────────────
+  const buildSVGAxes=(s,W,H,mg,pW,pH,tps,minX,maxX,minY,maxY,xs,ys,fmt)=>{
+    for(let i=0;i<=6;i++){
+      const val=minY+(maxY-minY)*i/6,y=ys(val).toFixed(1);
+      s+=`<line x1="${mg.left}" y1="${y}" x2="${W-mg.right}" y2="${y}" stroke="#EBEBF5" stroke-width="1"/>`;
+      s+=`<text x="${(mg.left-10)}" y="${(+y+4).toFixed(1)}" text-anchor="end" font-size="11" font-family="Arial,sans-serif" fill="#555">${fmt(val)}</text>`;
+    }
+    tps.forEach(t=>{
+      const x=xs(t).toFixed(1);
+      s+=`<line x1="${x}" y1="${mg.top}" x2="${x}" y2="${(mg.top+pH).toFixed(1)}" stroke="#EBEBF5" stroke-width="1"/>`;
+      s+=`<text x="${x}" y="${(mg.top+pH+20).toFixed(1)}" text-anchor="middle" font-size="11" font-family="Arial,sans-serif" fill="#555">${t}</text>`;
+    });
+    s+=`<line x1="${mg.left}" y1="${mg.top}" x2="${mg.left}" y2="${mg.top+pH}" stroke="#888" stroke-width="1.5"/>`;
+    s+=`<line x1="${mg.left}" y1="${mg.top+pH}" x2="${W-mg.right}" y2="${mg.top+pH}" stroke="#888" stroke-width="1.5"/>`;
+    const xLabelX=((mg.left+W-mg.right)/2).toFixed(1);
+    s+=`<text x="${xLabelX}" y="${H-12}" text-anchor="middle" font-size="13" font-family="Arial,sans-serif" fill="#333">Time (min)</text>`;
+    const yLabelY=((mg.top+mg.top+pH)/2).toFixed(1);
+    s+=`<text x="16" y="${yLabelY}" text-anchor="middle" font-size="13" font-family="Arial,sans-serif" fill="#333" transform="rotate(-90 16 ${yLabelY})">Absorbance at 580 nm</text>`;
+    return s;
   };
-  var qTp  = [0, 4, 8, 12, 24, 36, 48];
-  var qRaw = [['Timepoint_h',
-    'Unmodified_BioRep1','Unmodified_BioRep2','Unmodified_BioRep3',
-    'Modification 1_BioRep1','Modification 1_BioRep2','Modification 1_BioRep3']];
-  qTp.forEach(function(t, i) {
-    var u = qMean['Unmodified'][i], m = qMean['Modification 1'][i];
-    qRaw.push([t,
-      i === 0 ? 1 : jitter(u, 0.07), i === 0 ? 1 : jitter(u, 0.09), i === 0 ? 1 : jitter(u, 0.06),
-      i === 0 ? 1 : jitter(m, 0.06), i === 0 ? 1 : jitter(m, 0.08), i === 0 ? 1 : jitter(m, 0.05)
-    ]);
-  });
 
-  // --- d2eGFP raw data (irregular timepoints — readReporterFromExcel handles them) ---
-  var gMean = {
-    'Unmodified':    [0, 180, 520, 980, 1450, 1880, 2150, 2280, 2180, 1950, 1660, 1180, 820, 570, 390, 230, 140, 85, 55, 35, 22, 14, 8],
-    'Modification 1':[0, 320, 920, 1780, 2850, 4050, 5050, 5600, 5450, 5050, 4550, 3500, 2650, 1980, 1450, 920, 580, 360, 230, 145, 90, 55, 32]
+  const generateSVG=()=>{
+    if(!analysisData) return null;
+    const{tps}=analysisData;
+    const W=900,H=520,mg={top:40,right:40,bottom:70,left:90};
+    const pW=W-mg.left-mg.right,pH=H-mg.top-mg.bottom;
+    const visLines=chartLines.filter(l=>!isLineHidden(l));
+    const allVals=[];
+    chartData.forEach(pt=>visLines.forEach(l=>{
+      const v=pt[l.key];
+      if(typeof v==="number"&&!isNaN(v)){allVals.push(v);if(l.hasSD&&pt[`${l.key}_sd`]){allVals.push(v+pt[`${l.key}_sd`]);allVals.push(v-pt[`${l.key}_sd`]);}}
+    }));
+    const minX=Math.min(...tps),maxX=Math.max(...tps);
+    const rawMin=allVals.length?Math.min(...allVals):0,rawMax=allVals.length?Math.max(...allVals):1;
+    const pad=(rawMax-rawMin)*0.14||0.05;
+    const minY=0, maxY=rawMax+pad;
+    const xs=v=>mg.left+(v-minX)/(maxX-minX||1)*pW;
+    const ys=v=>mg.top+pH-(v-minY)/(maxY-minY||1)*pH;
+    const fmt=n=>Math.abs(n)<0.001&&n!==0?n.toExponential(2):n.toFixed(3);
+    let s=`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><rect width="100%" height="100%" fill="white"/>`;
+    s=buildSVGAxes(s,W,H,mg,pW,pH,tps,minX,maxX,minY,maxY,xs,ys,fmt);
+    visLines.forEach(l=>{
+      const pts=chartData.map(pt=>({x:xs(pt.t),y:ys(pt[l.key]),val:pt[l.key],sd:pt[`${l.key}_sd`]||0})).filter(p=>typeof p.val==="number"&&!isNaN(p.val));
+      if(!pts.length) return;
+      if(l.hasSD){
+        const cap=6;
+        pts.forEach(p=>{
+          if(!p.sd) return;
+          const yT=ys(p.val+p.sd),yB=ys(p.val-p.sd);
+          s+=`<line x1="${p.x.toFixed(1)}" y1="${yT.toFixed(1)}" x2="${p.x.toFixed(1)}" y2="${yB.toFixed(1)}" stroke="${l.color}" stroke-width="1.5"/>`;
+          s+=`<line x1="${(p.x-cap).toFixed(1)}" y1="${yT.toFixed(1)}" x2="${(p.x+cap).toFixed(1)}" y2="${yT.toFixed(1)}" stroke="${l.color}" stroke-width="1.5"/>`;
+          s+=`<line x1="${(p.x-cap).toFixed(1)}" y1="${yB.toFixed(1)}" x2="${(p.x+cap).toFixed(1)}" y2="${yB.toFixed(1)}" stroke="${l.color}" stroke-width="1.5"/>`;
+        });
+      }
+      s+=`<path d="${pts.map((p,i)=>`${i===0?"M":"L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")}" fill="none" stroke="${l.color}" stroke-width="2.2"/>`;
+      pts.forEach(p=>s+=`<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4" fill="${l.color}" stroke="white" stroke-width="1"/>`);
+    });
+    // legend: rect starts at lx-6, text starts at lx+30 → offset=36px; font-size 12 ≈ 6.5px/char
+    const lx=mg.left+16, liH=22;
+    const legendH=visLines.length*liH+10;
+    const legendW=Math.max(...visLines.map(l=>l.label.length))*6.5+46;
+    s+=`<rect x="${lx-6}" y="${mg.top+6}" width="${legendW}" height="${legendH}" fill="white" stroke="#DDD6F0" stroke-width="1" rx="5"/>`;
+    visLines.forEach((l,i)=>{const ly=mg.top+22+i*liH;s+=`<line x1="${lx}" y1="${ly}" x2="${lx+22}" y2="${ly}" stroke="${l.color}" stroke-width="2.2"/><circle cx="${lx+11}" cy="${ly}" r="4" fill="${l.color}" stroke="white" stroke-width="1"/><text x="${lx+30}" y="${ly+4}" font-size="12" font-family="Arial,sans-serif" fill="#333">${l.label}</text>`;});
+    s+=`</svg>`;
+    return s;
   };
-  var gTp  = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 28, 32, 36, 42, 48, 54, 60, 66, 72, 78, 84];
-  var gRaw = [['Time_h',
-    'Unmodified_BioRep1','Unmodified_BioRep2','Unmodified_BioRep3',
-    'Modification 1_BioRep1','Modification 1_BioRep2','Modification 1_BioRep3']];
-  gTp.forEach(function(t, i) {
-    var u = gMean['Unmodified'][i], m = gMean['Modification 1'][i];
-    gRaw.push([t,
-      jitter(u, 0.07), jitter(u, 0.09), jitter(u, 0.06),
-      jitter(m, 0.06), jitter(m, 0.08), jitter(m, 0.07)
-    ]);
-  });
 
-  // --- Run existing analysis pipeline with demo data ---
-  showView('analysis');
-  el('analysis-progress-area').innerHTML = '<div style="font-size:13px;color:var(--ts);margin-bottom:8px">Loading demo dataset...</div><div class="pb"><div class="pf" id="prog" style="width:0%"></div></div>';
-  setTimeout(function() { el('prog').style.width = '35%'; analyseQPCR(qRaw); }, 250);
-  setTimeout(function() { el('prog').style.width = '70%'; analyseGFP(gRaw);  }, 600);
-  setTimeout(function() {
-    el('prog').style.width = '100%';
-    var ar = ST.analysisResults;
-    if (ar && ar.qpcr && ar.gfp) renderIntegrated();
-    el('analysis-progress-area').innerHTML =
-      '<div class="ib ok">&#10003; Demo dataset loaded — <b>Unmodified vs Modification 1</b>. Proceed to <b>Mechanistic Model</b> to estimate k_trans per construct.</div>';
-    renderResultsSummary();
-  }, 1000);
-});
-// ================================================================
-var CHART_LABELS={
-  qpcr:       'qPCR — mRNA Decay',
-  gfp:        'GFP Incucyte — Protein Output',
-  nluc:       'NLuc — Luminescence',
-  integrated: 'Integrated Cross-Assay Comparison',
-  'mech-fit':     'Mechanistic — Observed vs Fitted',
-  'mech-scatter': 'Mechanistic — Half-life vs k_trans'
-};
+  // ── Generate SVG for Fit chart export ──────────────────────────────────────
+  const generateFitSVG=()=>{
+    if(!analysisData) return null;
+    const{tps,conditions,condMap}=analysisData;
+    const W=900,H=520,mg={top:40,right:40,bottom:70,left:90};
+    const pW=W-mg.left-mg.right,pH=H-mg.top-mg.bottom;
+    const maxT=Math.max(...tps);
+    const allVals=[];
+    conditions.forEach(c=>{
+      condMap[c].repMeans.forEach(v=>{if(!isNaN(v))allVals.push(v);});
+      const fr=fitResults[c];
+      if(fr&&!fr.error){allVals.push(fr.Amax);}
+    });
+    const minX=0,maxX=maxT;
+    const rawMin=allVals.length?Math.min(...allVals):0,rawMax=allVals.length?Math.max(...allVals):1;
+    const pad=(rawMax-rawMin)*0.14||0.05;
+    const minY=0, maxY=rawMax+pad;
+    const xs=v=>mg.left+(v-minX)/(maxX-minX||1)*pW;
+    const ys=v=>mg.top+pH-(v-minY)/(maxY-minY||1)*pH;
+    const fmt=n=>Math.abs(n)<0.001&&n!==0?n.toExponential(2):n.toFixed(3);
+    let s=`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><rect width="100%" height="100%" fill="white"/>`;
+    s=buildSVGAxes(s,W,H,mg,pW,pH,tps,minX,maxX,minY,maxY,xs,ys,fmt);
 
-function chartToPng(chartKey, label, callback) {
-  var instance = ST.charts[chartKey];
-  if (!instance) return;
-  // Render at 2x resolution for crisp export
-  var origCanvas = instance.canvas;
-  var w = origCanvas.width, h = origCanvas.height;
-  var offscreen = document.createElement('canvas');
-  offscreen.width  = w * 2;
-  offscreen.height = h * 2;
-  var ctx = offscreen.getContext('2d');
-  ctx.scale(2, 2);
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, w, h);
-  // Draw title
-  ctx.font = 'bold 11px sans-serif';
-  ctx.fillStyle = '#1e1b2e';
-  ctx.fillText(label, 10, 14);
-  // Draw chart content onto offscreen
-  ctx.drawImage(origCanvas, 0, 0, w, h);
-  if (callback) callback(offscreen.toDataURL('image/png'), label);
+    // title
+    s+=`<text x="${((mg.left+W-mg.right)/2).toFixed(1)}" y="${mg.top-12}" text-anchor="middle" font-size="13" font-family="Arial,sans-serif" fill="#7C6FAF" font-style="italic">Model: A(t) = A_max × (1 − e^(−k·t))</text>`;
+
+    conditions.forEach((c,ci)=>{
+      if(hiddenConds[c]) return;
+      const color=condColors[c]||PALETTE[ci%PALETTE.length];
+      const fr=fitResults[c];
+      // measured points + SD bars
+      tps.forEach((t,ti)=>{
+        const mv=condMap[c].repMeans[ti],sd=condMap[c].repSDs[ti];
+        if(isNaN(mv)) return;
+        const px=xs(t),py=ys(mv);
+        if(condMap[c].n>1&&sd>0){
+          const yT=ys(mv+sd),yB=ys(mv-sd),cap=5;
+          s+=`<line x1="${px.toFixed(1)}" y1="${yT.toFixed(1)}" x2="${px.toFixed(1)}" y2="${yB.toFixed(1)}" stroke="${color}" stroke-width="1.5"/>`;
+          s+=`<line x1="${(px-cap).toFixed(1)}" y1="${yT.toFixed(1)}" x2="${(px+cap).toFixed(1)}" y2="${yT.toFixed(1)}" stroke="${color}" stroke-width="1.5"/>`;
+          s+=`<line x1="${(px-cap).toFixed(1)}" y1="${yB.toFixed(1)}" x2="${(px+cap).toFixed(1)}" y2="${yB.toFixed(1)}" stroke="${color}" stroke-width="1.5"/>`;
+        }
+      });
+      // measured line
+      const mPts=tps.map((t,ti)=>({x:xs(t),y:ys(condMap[c].repMeans[ti]),v:condMap[c].repMeans[ti]})).filter(p=>!isNaN(p.v));
+      if(mPts.length>1) s+=`<path d="${mPts.map((p,i)=>`${i===0?"M":"L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")}" fill="none" stroke="${color}" stroke-width="1.8" opacity="0.5"/>`;
+      mPts.forEach(p=>s+=`<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4.5" fill="${color}" stroke="white" stroke-width="1.2"/>`);
+      // fitted curve (dashed)
+      if(fr&&!fr.error&&showFitCurves){
+        const nPts=80;
+        const fitPts=Array.from({length:nPts+1},(_,i)=>{const t=i*maxT/nPts;return{x:xs(t),y:ys(fr.Amax*(1-Math.exp(-fr.k*t)))};});
+        s+=`<path d="${fitPts.map((p,i)=>`${i===0?"M":"L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")}" fill="none" stroke="${color}" stroke-width="2.2" stroke-dasharray="8 4"/>`;
+      }
+    });
+
+    // legend
+    const lx=mg.left+16,liH=22;
+    const visC=conditions.filter(c=>!hiddenConds[c]);
+    const legendH=visC.length*liH+36,legendW=Math.max(...visC.map(c=>c.length))*7+80;
+    s+=`<rect x="${lx-6}" y="${mg.top+6}" width="${legendW}" height="${legendH}" fill="white" stroke="#DDD6F0" stroke-width="1" rx="5"/>`;
+    // legend header
+    s+=`<text x="${lx+2}" y="${mg.top+22}" font-size="10" font-family="Arial,sans-serif" fill="#888">● measured  – – fitted</text>`;
+    visC.forEach((c,i)=>{
+      const color=condColors[c]||PALETTE[conditions.indexOf(c)%PALETTE.length];
+      const ly=mg.top+36+i*liH;
+      s+=`<circle cx="${lx+6}" cy="${ly}" r="4" fill="${color}" stroke="white" stroke-width="1"/>`;
+      s+=`<line x1="${lx+16}" y1="${ly}" x2="${lx+32}" y2="${ly}" stroke="${color}" stroke-width="2" stroke-dasharray="6 3"/>`;
+      s+=`<text x="${lx+38}" y="${ly+4}" font-size="11" font-family="Arial,sans-serif" fill="#333">${c}</text>`;
+    });
+    s+=`</svg>`;
+    return s;
+  };
+
+  // ── Exports ────────────────────────────────────────────────────────────────
+  const exportChartImage=()=>{
+    if(!analysisData){setModal({type:"error",msg:"No data."});return;}
+    try{
+      const svgStr=generateSVG();
+      const b64=btoa(unescape(encodeURIComponent(svgStr)));
+      setModal({type:"image",url:`data:image/svg+xml;base64,${b64}`,filename:`${expName||"assay"}_chart`});
+    }catch(e){setModal({type:"error",msg:String(e)});}
+  };
+
+  const exportFitChartImage=()=>{
+    if(!analysisData){setModal({type:"error",msg:"No data."});return;}
+    try{
+      const svgStr=generateFitSVG();
+      const b64=btoa(unescape(encodeURIComponent(svgStr)));
+      setModal({type:"image",url:`data:image/svg+xml;base64,${b64}`,filename:`${expName||"assay"}_fit_chart`});
+    }catch(e){setModal({type:"error",msg:String(e)});}
+  };
+
+  const exportCSV=type=>{
+    if(!analysisData) return;
+    const{tps,rows,conditions,condMap}=analysisData;
+    let csv="";
+    if(type==="raw"){csv=["Condition","File","Row","Approach",...tps.map(t=>`t=${t}min`)].join(",")+"\n";rows.forEach(r=>{csv+=[r.cond,files[r.fileIdx].name,r.rowLabel,r.approach,...r.raw.map(v=>isNaN(v)?"":v)].join(",")+"\n";});}
+    else if(type==="corrected"){csv=["Condition","File","Row","Approach",...tps.map(t=>`t=${t}min`)].join(",")+"\n";rows.forEach(r=>{csv+=[r.cond,files[r.fileIdx].name,r.rowLabel,r.approach,...r.corrected.map(v=>isNaN(v)?"":v.toFixed(4))].join(",")+"\n";});}
+    else{csv=["Condition","n",...tps.flatMap(t=>[`mean_t=${t}`,`sd_t=${t}`])].join(",")+"\n";conditions.forEach(c=>{const d=condMap[c];csv+=[c,d.n,...tps.flatMap((_,ti)=>[isNaN(d.repMeans[ti])?"":d.repMeans[ti].toFixed(4),d.repSDs[ti].toFixed(4)])].join(",")+"\n";});}
+    const b64=btoa(unescape(encodeURIComponent(csv)));
+    setModal({type:"download",url:`data:text/csv;base64,${b64}`,filename:`${type}_data.csv`});
+  };
+
+  const exportFitCSV=()=>{
+    if(!analysisData) return;
+    const{conditions}=analysisData;
+    let csv="Condition,Equation,Amax,k (min-1),t_half (min),R2,RMSE,N_points,Status\n";
+    conditions.forEach(c=>{
+      const fr=fitResults[c];
+      if(!fr){csv+=`"${c}",,,,,,,,No result\n`;return;}
+      if(fr.error){csv+=`"${c}","A(t)=Amax*(1-exp(-k*t))",,,,,,,"${fr.error}"\n`;return;}
+      csv+=`"${c}","A(t)=Amax*(1-exp(-k*t))",${fr.Amax.toFixed(5)},${fr.k.toFixed(6)},${fr.tHalf.toFixed(3)},${fr.r2.toFixed(4)},${fr.rmse.toFixed(6)},${fr.n},OK\n`;
+    });
+    const b64=btoa(unescape(encodeURIComponent(csv)));
+    setModal({type:"download",url:`data:text/csv;base64,${b64}`,filename:"curve_fit_results.csv"});
+  };
+
+  const updateMapping=(mIdx,key,val)=>setMappings(prev=>{const m=[...prev];m[mIdx]={...m[mIdx],[key]:val};return m;});
+
+  // ── PasteImport ────────────────────────────────────────────────────────────
+  const PasteImport=({fi})=>{
+    const [raw,setRaw]=useState(""); const [preview,setPreview]=useState([]); const [rev,setRev]=useState(true); const [msg,setMsg]=useState("");
+    const parse=text=>text.trim().split(/\r?\n/).map(l=>l.split("\t").map(s=>s.trim()).filter(Boolean)).flat().filter(Boolean).slice(0,8);
+    const handleChange=text=>{setRaw(text);const n=parse(text);setPreview(n);setMsg(n.length?`${n.length} name(s) detected.`:"No names detected.");};
+    const apply=()=>{
+      const ordered=rev?[...preview].reverse():preview;
+      setMappings(prev=>{const m=[...prev];ordered.forEach((name,i)=>{const idx=m.findIndex(x=>x.fileIdx===fi&&x.rowIdx===i);if(idx>=0&&name)m[idx]={...m[idx],condName:name};});return m;});
+      setMsg("✅ Applied!"); setRaw(""); setPreview([]);
+    };
+    return(
+      <div style={{background:"#F3F0FA",borderRadius:"10px",padding:"14px 16px",marginBottom:"14px",border:"1px dashed #C8BDE8"}}>
+        <div style={{fontSize:"13px",fontWeight:600,color:"#7C6FAF",marginBottom:"4px"}}>📋 Paste condition names from Excel</div>
+        <div style={{fontSize:"12px",color:"#888",marginBottom:"8px"}}>Paste horizontal or vertical names (max 8).</div>
+        <textarea style={{...S.input,minHeight:"48px",resize:"vertical",fontSize:"12px",fontFamily:"monospace"}} placeholder="Paste here (Ctrl+V)…" value={raw} onChange={e=>handleChange(e.target.value)}/>
+        {preview.length>0&&(<div style={{marginTop:"8px"}}>
+          <div style={{display:"flex",gap:"16px",alignItems:"center",marginBottom:"6px",flexWrap:"wrap"}}>
+            <span style={{fontSize:"12px",color:"#5B4A8A",fontWeight:600}}>Preview:</span>
+            <label style={{fontSize:"12px",color:"#5B4A8A",cursor:"pointer",display:"flex",alignItems:"center",gap:"4px"}}><input type="radio" checked={!rev} onChange={()=>setRev(false)}/> 1st → A</label>
+            <label style={{fontSize:"12px",color:"#5B4A8A",cursor:"pointer",display:"flex",alignItems:"center",gap:"4px"}}><input type="radio" checked={rev} onChange={()=>setRev(true)}/> 1st → H</label>
+          </div>
+          <div style={{display:"flex",gap:"6px",flexWrap:"wrap"}}>
+            {(rev?[...preview].reverse():preview).map((name,i)=>(<span key={i} style={{padding:"3px 10px",borderRadius:"12px",background:"#fff",border:"1px solid #C8BDE8",fontSize:"12px"}}><span style={{color:"#aaa"}}>{ROWS[i]}: </span>{name}</span>))}
+          </div>
+          <button style={{...S.btn,...S.btnPrimary,marginTop:"10px",fontSize:"12px",padding:"6px 14px"}} onClick={apply}>✔ Apply</button>
+        </div>)}
+        {msg&&<div style={{fontSize:"12px",color:msg.startsWith("✅")?"#5B8A5B":"#7C6FAF",marginTop:"6px"}}>{msg}</div>}
+      </div>
+    );
+  };
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+  const tps=getParsedTPs();
+  const conditions=analysisData?.conditions||[];
+  const condMap=analysisData?.condMap||{};
+  const rows=analysisData?.rows||[];
+
+  return(
+    <div style={S.app}>
+      <div style={{maxWidth:"1160px",margin:"0 auto"}}>
+        <div style={{marginBottom:"20px"}}>
+          <div style={S.h1}>OAS Activity Assay Analyzer</div>
+          <div style={{fontSize:"12px",color:"#aaa"}}>96-Well Plate · Absorbance 580 nm · Baseline Correction · Replicate Analysis · Curve Fitting</div>
+        </div>
+
+        <div style={{display:"flex",gap:"8px",marginBottom:"20px",fontSize:"12px"}}>
+          {["Upload","Metadata & Mapping","Analysis"].map((s,i)=>(
+            <span key={i} style={{padding:"4px 12px",borderRadius:"20px",background:step===i?"#7C6FAF":step>i?"#C8BDE8":"#EDE9F8",color:step===i?"#fff":step>i?"#5B4A8A":"#aaa",fontWeight:step===i?600:400}}>{i+1}. {s}</span>
+          ))}
+        </div>
+
+        {/* STEP 0 */}
+        {step===0&&(<div style={S.card}>
+          <div style={S.h2}>📂 Upload Excel Files</div>
+          <p style={{fontSize:"13px",color:"#888",marginBottom:"16px"}}>Upload one or more 96-well plate Excel exports. The app auto-detects the result table via the "&lt;&gt;" cell.</p>
+          <label style={{...S.btn,...S.btnPrimary,display:"inline-block",cursor:"pointer"}}>
+            Select Files <input type="file" multiple accept=".xlsx,.xls" onChange={handleFiles} style={{display:"none"}}/>
+          </label>
+          {parseErrors.map((e,i)=><div key={i} style={{...S.error,marginTop:"10px"}}>⚠ {e}</div>)}
+        </div>)}
+
+        {/* STEP 1 */}
+        {step===1&&(<>
+          <div style={S.card}>
+            <div style={S.h2}>🔬 Experiment Metadata</div>
+            <div style={S.row}>
+              <div style={S.col}><label style={S.label}>Experiment Name</label><input style={S.input} value={expName} onChange={e=>setExpName(e.target.value)} placeholder="e.g. OAS1 Assay #3"/></div>
+              <div style={S.col}><label style={S.label}>Date</label><input style={S.input} type="date" value={expDate} onChange={e=>setExpDate(e.target.value)}/></div>
+              <div style={S.col}><label style={S.label}>Assay Type</label><input style={S.input} value={assayType} onChange={e=>setAssayType(e.target.value)}/></div>
+            </div>
+            <div style={{...S.row,marginTop:"14px"}}>
+              <div style={{flex:2,minWidth:"300px"}}><label style={S.label}>Time Points in minutes (comma-separated)</label><input style={S.input} value={timepoints} onChange={e=>setTimepoints(e.target.value)} placeholder="0, 5, 10, 20, 40, 60, 80, 100, 120"/></div>
+            </div>
+            <div style={{marginTop:"14px"}}><label style={S.label}>Notes</label><textarea style={{...S.input,minHeight:"60px",resize:"vertical"}} value={notes} onChange={e=>setNotes(e.target.value)}/></div>
+          </div>
+          {files.map((f,fi)=>(<div key={fi} style={S.card}>
+            <div style={S.h2}>🧫 File: <span style={{color:"#2d2540"}}>{f.name}</span></div>
+            <PasteImport fi={fi}/>
+            <table style={S.table}>
+              <thead><tr><th style={S.th}>Plate Row</th><th style={S.th}>Condition Name</th><th style={S.th}>Approach</th><th style={S.th}>Notes</th></tr></thead>
+              <tbody>{ROWS.map((row,ri)=>{
+                const mIdx=mappings.findIndex(m=>m.fileIdx===fi&&m.rowIdx===ri);
+                const m=mappings[mIdx];
+                return m?(<tr key={ri} style={{background:ri%2===0?"#FDFBFF":"#F8F5FD"}}>
+                  <td style={S.td}><span style={S.tag}>{row}</span></td>
+                  <td style={S.td}><input style={{...S.input,width:"160px"}} value={m.condName} onChange={e=>updateMapping(mIdx,"condName",e.target.value)} placeholder="e.g. OAS1 + RNA"/></td>
+                  <td style={S.td}><input style={{...S.input,width:"140px"}} value={m.approach} onChange={e=>updateMapping(mIdx,"approach",e.target.value)}/></td>
+                  <td style={S.td}><input style={S.input} value={m.rowNotes} onChange={e=>updateMapping(mIdx,"rowNotes",e.target.value)} placeholder="optional"/></td>
+                </tr>):null;
+              })}</tbody>
+            </table>
+          </div>))}
+          <div style={{display:"flex",gap:"12px"}}>
+            <button style={{...S.btn,...S.btnSecondary}} onClick={()=>setStep(0)}>← Back</button>
+            <button style={{...S.btn,...S.btnPrimary}} onClick={()=>setStep(2)}>Start Analysis →</button>
+          </div>
+        </>)}
+
+        {/* STEP 2 */}
+        {step===2&&(<>
+          <div style={S.card}>
+            <div style={{...S.h1,marginBottom:"8px"}}>{expName||"Experiment"}</div>
+            <div style={{fontSize:"13px",color:"#888",display:"flex",gap:"20px",flexWrap:"wrap"}}>
+              {expDate&&<span>📅 {expDate}</span>}
+              <span>🧪 {assayType}</span><span>🗂 {files.length} file(s)</span>
+              <span>🔬 {conditions.length} conditions</span><span>⏱ {tps.length} time points</span>
+            </div>
+            {notes&&<div style={{marginTop:"8px",fontSize:"12px",color:"#aaa"}}>📝 {notes}</div>}
+          </div>
+
+          <div style={S.tabBar}>
+            {[["chart","📈 Chart"],["raw","📋 Raw Data"],["corrected","🔧 Corrected"],["summary","📊 Summary"],["fit","📉 Curve Fit"]].map(([t,label])=>(
+              <button key={t} style={S.tab(activeTab===t)} onClick={()=>setActiveTab(t)}>{label}</button>
+            ))}
+            <button style={{...S.btn,...S.btnSecondary,marginLeft:"auto"}} onClick={()=>setStep(1)}>← Metadata</button>
+          </div>
+
+          {/* ── Chart tab ── */}
+          {activeTab==="chart"&&(<div style={S.card}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:"16px",flexWrap:"wrap",gap:"12px"}}>
+              <div style={{display:"flex",gap:"12px",flexWrap:"wrap",alignItems:"center"}}>
+                <div><label style={S.label}>Display Mode</label>
+                  <select style={{...S.input,width:"auto"}} value={chartMode} onChange={e=>setChartMode(e.target.value)}>
+                    <option value="corrected">Baseline-corrected (individual)</option>
+                    <option value="raw">Raw data (individual)</option>
+                    <option value="mean">Replicate Mean ± SD</option>
+                  </select>
+                </div>
+                {chartMode==="mean"&&<div style={{display:"flex",alignItems:"center",gap:"6px",marginTop:"18px"}}>
+                  <input type="checkbox" id="sd" checked={showSD} onChange={e=>setShowSD(e.target.checked)}/>
+                  <label htmlFor="sd" style={{fontSize:"13px",color:"#5B4A8A"}}>Show SD</label>
+                </div>}
+              </div>
+              <button style={{...S.btn,...S.btnSecondary,marginTop:"18px"}} onClick={exportChartImage}>⬇ PNG</button>
+            </div>
+            <div style={{display:"flex",gap:"8px",flexWrap:"wrap",marginBottom:"12px"}}>
+              {conditions.map((c,ci)=>{
+                const color=condColors[c]||PALETTE[ci%PALETTE.length];
+                return(<div key={c} style={{display:"flex",alignItems:"center",gap:"6px",padding:"4px 10px",borderRadius:"20px",border:`2px solid ${color}`,background:hiddenConds[c]?"#f8f8f8":"#fff",cursor:"pointer",opacity:hiddenConds[c]?0.5:1}} onClick={()=>setHiddenConds(p=>({...p,[c]:!p[c]}))}>
+                  <input type="color" value={color} style={{width:"16px",height:"16px",border:"none",cursor:"pointer",padding:0}} onClick={e=>e.stopPropagation()} onChange={e=>{e.stopPropagation();setCondColors(p=>({...p,[c]:e.target.value}));}}/>
+                  <span style={{fontSize:"12px",userSelect:"none"}}>{c}</span>
+                  {condMap[c]?.n>1&&<span style={S.badge}>n={condMap[c].n}</span>}
+                </div>);
+              })}
+            </div>
+            <ResponsiveContainer width="100%" height={380}>
+              <LineChart data={chartData} margin={{top:10,right:30,left:20,bottom:30}}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#EDE9F8"/>
+                <XAxis dataKey="t" label={{value:"Time (min)",position:"insideBottom",offset:-15,fontSize:13}} tick={{fontSize:11}}/>
+                <YAxis domain={[0,'auto']} label={{value:"Absorbance at 580 nm",angle:-90,position:"insideLeft",offset:10,dy:-60,fontSize:12}} tick={{fontSize:11}}/>
+                <Tooltip contentStyle={{fontSize:"12px",borderRadius:"8px",border:"1px solid #DDD6F0"}} formatter={(v,n)=>[typeof v==="number"?v.toFixed(4):v,n]}/>
+                <Legend verticalAlign="top" align="left" wrapperStyle={{fontSize:"12px",paddingBottom:"8px"}}/>
+                {chartLines.map(l=>{
+                  if(isLineHidden(l)) return null;
+                  const color=condColors[l.parentCond]||PALETTE[conditions.indexOf(l.parentCond)%PALETTE.length];
+                  return(<Line key={l.key} type="linear" dataKey={l.key} stroke={color} strokeWidth={chartMode==="mean"?2.5:1.8} dot={{r:3}} activeDot={{r:5}}>
+                    {l.hasSD&&<ErrorBar dataKey={`${l.key}_sd`} width={4} strokeWidth={1.5} stroke={color} opacity={0.6}/>}
+                  </Line>);
+                })}
+              </LineChart>
+            </ResponsiveContainer>
+          </div>)}
+
+          {/* ── Raw tab ── */}
+          {activeTab==="raw"&&(<div style={S.card}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"12px"}}>
+              <div style={S.h2}>Raw Data (Absorbance)</div>
+              <button style={{...S.btn,...S.btnSecondary}} onClick={()=>exportCSV("raw")}>⬇ CSV</button>
+            </div>
+            <div style={{overflowX:"auto"}}>
+              <table style={S.table}>
+                <thead><tr><th style={S.th}>Condition</th><th style={S.th}>File</th><th style={S.th}>Row</th>{tps.map(t=><th key={t} style={S.th}>{t} min</th>)}</tr></thead>
+                <tbody>{rows.map((r,i)=>(<tr key={i} style={{background:i%2===0?"#FDFBFF":"#F8F5FD"}}>
+                  <td style={S.td}><b>{r.cond}</b></td><td style={S.td}>{files[r.fileIdx].name}</td><td style={S.td}>{r.rowLabel}</td>
+                  {r.raw.map((v,ti)=><td key={ti} style={S.td}>{isNaN(v)?"—":v.toFixed(4)}</td>)}
+                </tr>))}</tbody>
+              </table>
+            </div>
+          </div>)}
+
+          {/* ── Corrected tab ── */}
+          {activeTab==="corrected"&&(<div style={S.card}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"12px"}}>
+              <div style={S.h2}>Baseline-Corrected Data (t=0 subtracted)</div>
+              <button style={{...S.btn,...S.btnSecondary}} onClick={()=>exportCSV("corrected")}>⬇ CSV</button>
+            </div>
+            <div style={{overflowX:"auto"}}>
+              <table style={S.table}>
+                <thead><tr><th style={S.th}>Condition</th><th style={S.th}>File</th><th style={S.th}>Row</th>{tps.map(t=><th key={t} style={S.th}>{t} min</th>)}</tr></thead>
+                <tbody>{rows.map((r,i)=>(<tr key={i} style={{background:i%2===0?"#FDFBFF":"#F8F5FD"}}>
+                  <td style={S.td}><b>{r.cond}</b></td><td style={S.td}>{files[r.fileIdx].name}</td><td style={S.td}>{r.rowLabel}</td>
+                  {r.corrected.map((v,ti)=><td key={ti} style={{...S.td,color:ti===0?"#ccc":"inherit"}}>{isNaN(v)?"—":v.toFixed(4)}</td>)}
+                </tr>))}</tbody>
+              </table>
+            </div>
+          </div>)}
+
+          {/* ── Summary tab ── */}
+          {activeTab==="summary"&&(<div style={S.card}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"12px"}}>
+              <div style={S.h2}>Replicate Summary (Mean ± SD)</div>
+              <button style={{...S.btn,...S.btnSecondary}} onClick={()=>exportCSV("summary")}>⬇ CSV</button>
+            </div>
+            <div style={{overflowX:"auto"}}>
+              <table style={S.table}>
+                <thead><tr><th style={S.th}>Condition</th><th style={S.th}>n</th>{tps.map(t=><th key={t} style={{...S.th,minWidth:"110px"}}>{t} min</th>)}</tr></thead>
+                <tbody>{conditions.map((c,ci)=>{const d=condMap[c];return(<tr key={ci} style={{background:ci%2===0?"#FDFBFF":"#F8F5FD"}}>
+                  <td style={S.td}><b>{c}</b></td><td style={S.td}>{d.n}</td>
+                  {tps.map((_,ti)=>(<td key={ti} style={S.td}>{isNaN(d.repMeans[ti])?"—":<>{d.repMeans[ti].toFixed(4)}{d.n>1&&<span style={{color:"#aaa",fontSize:"11px"}}> ±{d.repSDs[ti].toFixed(4)}</span>}</>}</td>))}
+                </tr>);})}</tbody>
+              </table>
+            </div>
+          </div>)}
+
+          {/* ── Curve Fit tab ── */}
+          {activeTab==="fit"&&(<>
+            <div style={{...S.card,borderLeft:"4px solid #7C6FAF"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:"12px"}}>
+                <div>
+                  <div style={S.h2}>📉 Curve Fit Analysis</div>
+                  <div style={{fontSize:"12px",color:"#888",marginBottom:"8px"}}>
+                    Model: <code style={{background:"#F3F0FA",padding:"2px 8px",borderRadius:"4px",fontSize:"12px"}}>A(t) = A_max × (1 − e<sup>−k·t</sup>)</code>
+                    &nbsp;— Single-phase exponential association fitted to replicate means via Levenberg-Marquardt.
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:"8px",flexWrap:"wrap"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:"6px"}}>
+                    <input type="checkbox" id="showFit" checked={showFitCurves} onChange={e=>setShowFitCurves(e.target.checked)}/>
+                    <label htmlFor="showFit" style={{fontSize:"13px",color:"#5B4A8A"}}>Show fitted curves</label>
+                  </div>
+                  <button style={{...S.btn,...S.btnSecondary}} onClick={exportFitChartImage}>⬇ PNG</button>
+                </div>
+              </div>
+
+              {/* condition visibility toggles */}
+              <div style={{display:"flex",gap:"8px",flexWrap:"wrap",marginBottom:"16px"}}>
+                {conditions.map((c,ci)=>{
+                  const color=condColors[c]||PALETTE[ci%PALETTE.length];
+                  return(<div key={c} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 10px",borderRadius:"20px",border:`2px solid ${color}`,background:hiddenConds[c]?"#f8f8f8":"#fff",cursor:"pointer",opacity:hiddenConds[c]?0.45:1}} onClick={()=>setHiddenConds(p=>({...p,[c]:!p[c]}))}>
+                    <div style={{width:"10px",height:"10px",borderRadius:"50%",background:color}}/>
+                    <span style={{fontSize:"12px",userSelect:"none"}}>{c}</span>
+                  </div>);
+                })}
+              </div>
+
+              <ResponsiveContainer width="100%" height={400}>
+                <LineChart data={fitChartData} margin={{top:10,right:30,left:20,bottom:30}}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#EDE9F8"/>
+                  <XAxis dataKey="t" type="number" domain={["dataMin","dataMax"]} label={{value:"Time (min)",position:"insideBottom",offset:-15,fontSize:13}} tick={{fontSize:11}}/>
+                <YAxis domain={[0,'auto']} label={{value:"Absorbance at 580 nm",angle:-90,position:"insideLeft",offset:10,dy:-60,fontSize:12}} tick={{fontSize:11}}/>
+                  <Tooltip contentStyle={{fontSize:"11px",borderRadius:"8px",border:"1px solid #DDD6F0"}} formatter={(v,n)=>[typeof v==="number"?v.toFixed(4):v,n]} labelFormatter={l=>`t = ${(+l).toFixed(1)} min`}/>
+                  <Legend verticalAlign="top" align="left" wrapperStyle={{fontSize:"11px",paddingBottom:"8px"}}/>
+                  {conditions.map((c,ci)=>{
+                    if(hiddenConds[c]) return null;
+                    const color=condColors[c]||PALETTE[ci%PALETTE.length];
+                    const fr=fitResults[c];
+                    return([
+                      // Measured (mean) – solid line + dots
+                      <Line key={`${c}_meas`} type="linear" dataKey={`${c}_meas`} name={c} stroke={color} strokeWidth={1.8} dot={{r:4,fill:color}} activeDot={{r:6}} connectNulls={true} legendType="circle"/>,
+                      // Fitted – dashed, no dots
+                      showFitCurves&&fr&&!fr.error&&<Line key={`${c}_fit`} type="monotone" dataKey={`${c}_fit`} name={`${c} (fit)`} stroke={color} strokeWidth={2} strokeDasharray="7 4" dot={false} activeDot={false} legendType="plainline"/>
+                    ]);
+                  })}
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+
+            {/* Fit parameters table */}
+            <div style={S.card}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"14px"}}>
+                <div style={S.h2}>Fit Parameters</div>
+                <button style={{...S.btn,...S.btnSecondary}} onClick={exportFitCSV}>⬇ CSV</button>
+              </div>
+              <div style={{overflowX:"auto"}}>
+                <table style={S.table}>
+                  <thead><tr>
+                    <th style={S.th}>Condition</th>
+                    <th style={S.th}>A<sub>max</sub></th>
+                    <th style={S.th}>k (min⁻¹)</th>
+                    <th style={S.th}>t<sub>½</sub> (min)</th>
+                    <th style={S.th}>R²</th>
+                    <th style={S.th}>RMSE</th>
+                    <th style={S.th}>n</th>
+                    <th style={S.th}>Status</th>
+                  </tr></thead>
+                  <tbody>{conditions.map((c,ci)=>{
+                    const fr=fitResults[c];
+                    const color=condColors[c]||PALETTE[ci%PALETTE.length];
+                    if(!fr) return null;
+                    const good=!fr.error&&fr.r2>=0.95;
+                    const ok=!fr.error&&fr.r2>=0.85;
+                    const statusColor=fr.error?"#b03030":good?"#3a7a3a":ok?"#8a6a1a":"#b03030";
+                    const statusLabel=fr.error?"⚠ Failed":good?"✔ Good":ok?"△ Moderate":"✘ Poor fit";
+                    return(<tr key={ci} style={{background:ci%2===0?"#FDFBFF":"#F8F5FD"}}>
+                      <td style={S.td}><span style={{display:"inline-block",width:"10px",height:"10px",borderRadius:"50%",background:color,marginRight:"6px",verticalAlign:"middle"}}/>
+                        <b>{c}</b></td>
+                      {fr.error?<>
+                        <td style={S.td} colSpan={6}><span style={{color:"#b03030",fontSize:"12px"}}>{fr.error}</span></td>
+                      </>:<>
+                        <td style={S.td}>{fr.Amax.toFixed(4)}</td>
+                        <td style={S.td}>{fr.k.toFixed(5)}</td>
+                        <td style={S.td}>{fr.tHalf.toFixed(2)}</td>
+                        <td style={S.td}><b style={{color:statusColor}}>{fr.r2.toFixed(4)}</b></td>
+                        <td style={S.td}>{fr.rmse.toFixed(5)}</td>
+                        <td style={S.td}>{fr.n}</td>
+                      </>}
+                      <td style={S.td}><span style={{color:statusColor,fontSize:"12px",fontWeight:600}}>{statusLabel}</span></td>
+                    </tr>);
+                  })}</tbody>
+                </table>
+              </div>
+              <div style={{marginTop:"12px",fontSize:"11px",color:"#aaa",lineHeight:"1.6"}}>
+                <b>Model:</b> A(t) = A<sub>max</sub> × (1 − e<sup>−k·t</sup>) &nbsp;|&nbsp;
+                <b>A<sub>max</sub></b>: maximum absorbance &nbsp;|&nbsp;
+                <b>k</b>: rate constant &nbsp;|&nbsp;
+                <b>t<sub>½</sub></b>: half-time = ln(2)/k &nbsp;|&nbsp;
+                Fit applied to replicate means. R² ≥ 0.95 = Good, ≥ 0.85 = Moderate.
+              </div>
+            </div>
+          </>)}
+        </>)}
+
+        {/* ── Modal ── */}
+        {modal&&(<div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000}} onClick={()=>setModal(null)}>
+          <div style={{background:"#fff",borderRadius:"14px",padding:"24px 28px",maxWidth:modal.type==="image"?"740px":"400px",width:"92%",textAlign:"center",boxShadow:"0 8px 32px rgba(0,0,0,0.2)"}} onClick={e=>e.stopPropagation()}>
+            {modal.type==="error"&&<><div style={{fontSize:"15px",fontWeight:700,color:"#b03030",marginBottom:"8px"}}>⚠ Error</div><div style={{fontSize:"13px",color:"#888",marginBottom:"16px"}}>{modal.msg}</div></>}
+            {modal.type==="image"&&<>
+              <div style={{fontSize:"16px",fontWeight:700,color:"#5B4A8A",marginBottom:"6px"}}>📊 Save as PNG</div>
+              <div style={{fontSize:"12px",color:"#888",marginBottom:"12px",lineHeight:"1.7"}}><b>Right-click</b> the image → <b>"Save image as"</b> → save as <b>PNG</b></div>
+              <img src={modal.url} alt="Chart" style={{width:"100%",borderRadius:"8px",border:"1px solid #EDE9F8",display:"block"}}/>
+              <div style={{fontSize:"11px",color:"#bbb",marginTop:"8px"}}>You can also open the image in a new tab to save it from there.</div>
+            </>}
+            {modal.type==="download"&&<>
+              <div style={{fontSize:"16px",fontWeight:700,color:"#5B4A8A",marginBottom:"8px"}}>⬇ Download File</div>
+              <div style={{fontSize:"13px",color:"#888",marginBottom:"20px"}}>Click to save <b>{modal.filename}</b></div>
+              <a href={modal.url} download={modal.filename} style={{display:"inline-block",padding:"10px 24px",background:"#7C6FAF",color:"#fff",borderRadius:"8px",fontWeight:600,fontSize:"14px",textDecoration:"none",marginBottom:"12px"}}>💾 {modal.filename}</a><br/>
+            </>}
+            <button style={{...S.btn,...S.btnSecondary,marginTop:"12px"}} onClick={()=>setModal(null)}>Close</button>
+          </div>
+        </div>)}
+      </div>
+    </div>
+  );
 }
-
-function downloadPng(dataUrl, filename) {
-  var a = document.createElement('a');
-  a.href = dataUrl;
-  a.download = filename.replace(/[^a-z0-9_\-]/gi, '_') + '.png';
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(function(){ document.body.removeChild(a); }, 200);
-}
-
-function renderExportPage() {
-  var keys = Object.keys(CHART_LABELS);
-  var available = keys.filter(function(k){ return !!ST.charts[k]; });
-  if (!available.length) {
-    el('export-grid').innerHTML = '<div class="ib">Run Analysis (and optionally Mechanistic Model) first to generate charts.</div>';
-    return;
-  }
-  var html = '';
-  available.forEach(function(k) {
-    var label = CHART_LABELS[k];
-    var instance = ST.charts[k];
-    if (!instance) return;
-    // Thumbnail: use the existing canvas via toDataURL
-    var thumb = instance.toBase64Image('image/png', 1);
-    html += '<div class="mc-box" style="padding:12px">'
-          + '<div style="font-weight:700;font-size:12px;margin-bottom:8px;color:var(--ind700)">'+label+'</div>'
-          + '<img src="'+thumb+'" style="width:100%;border-radius:var(--rs);border:1px solid var(--border);margin-bottom:10px;background:#fff"/>'
-          + '<button class="btn bs bsm" style="width:100%" onclick="exportChart(\''+k+'\')">&#8681; Download PNG</button>'
-          + '</div>';
-  });
-  el('export-grid').innerHTML = html;
-}
-
-window.exportChart = function(k) {
-  var label = CHART_LABELS[k] || k;
-  var instance = ST.charts[k];
-  if (!instance) return;
-  // White background + high-res export
-  var orig = instance.canvas;
-  var w = orig.width, h = orig.height;
-  var off = document.createElement('canvas');
-  off.width = w * 2; off.height = h * 2;
-  var ctx = off.getContext('2d');
-  ctx.scale(2, 2);
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, w, h);
-  ctx.drawImage(orig, 0, 0, w, h);
-  downloadPng(off.toDataURL('image/png'), label);
-};
-
-el('btn-export-all').addEventListener('click', function() {
-  var keys = Object.keys(CHART_LABELS);
-  var available = keys.filter(function(k){ return !!ST.charts[k]; });
-  if (!available.length) { alert('No charts available yet.'); return; }
-  // Stagger downloads to avoid browser blocking
-  available.forEach(function(k, i) {
-    setTimeout(function() { window.exportChart(k); }, i * 300);
-  });
-});
-
-})();
-</script>
-</body>
-</html>
